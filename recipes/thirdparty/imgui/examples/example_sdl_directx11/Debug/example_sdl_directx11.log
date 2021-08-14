@@ -1,0 +1,11 @@
+﻿  imgui.cpp
+  imgui_demo.cpp
+  imgui_draw.cpp
+  imgui_tables.cpp
+  imgui_widgets.cpp
+  imgui_impl_dx11.cpp
+  imgui_impl_sdl.cpp
+  main.cpp
+C:\Github\ps_cpp_recipes\recipes\thirdparty\imgui\backends\imgui_impl_sdl.cpp(52,10): fatal error C1083: Cannot open include file: 'SDL.h': No such file or directory
+  Generating Code...
+C:\Github\ps_cpp_recipes\recipes\thirdparty\imgui\examples\example_sdl_directx11\main.cpp(11,10): fatal error C1083: Cannot open include file: 'SDL.h': No such file or directory

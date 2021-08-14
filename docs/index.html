@@ -1,0 +1,3721 @@
+<meta charset="utf-8" emacsmode="-*- markdown -*-"><link rel="stylesheet" href="./apidoc_modified.css">
+
+**Photoshop C++ Recipes**
+
+Hi.
+
+If you read the title of this document and are wondering if I'm going to be
+introducing some delicious recipes for your next weekend brunch, the answer is
+no. Instead, I'll be going over some seemingly innocuous tasks that you might
+find yourself doing should you ever have the unfortunate task of having to work
+on native Photoshop plugins.
+
+Just so you can know at a glance if this tutorial is for you, I'll be covering
+the following topics:
+
+* Getting started creating native (C++) Photoshop plugins in a minimalist manner;
+
+* Reading layer data directly within Photoshop entirely through C++;
+
+* Combining an Automation to run a "hidden" Filter plugin;
+
+* Communicating between a traditional CEP panel in Photoshop and a native C++
+  plugin using Adobe native CSXS events;
+
+* Creating your own GUIs directly without going through CEP. In this tutorial,
+  I'll be focusing on using Dear ImGui (https://github.com/ocornut/imgui) since
+  it's quickly becoming the most ubiquitous UI framework out available for use.
+
+Some of these recipes are already in the samples included in the SDK, but
+they're pretty obtuse and not necessarily implemented in an easy-to-understand
+manner (at least, it took me a while to grok them). Hopefully the recipes here
+will be far less bloated.
+
+
+# Code Repository #
+
+All the source code for this tutorial is
+available [here](https://github.com/sonictk/ps_cpp_recipes). Feel free to
+inspect the source code while following along with this tutorial, since the
+sources have more comments to help document what certain code is meant to
+accomplish; the sources here are slightly more slimmed-down in order to enhance
+readability.
+
+A word of caution: this code is written in a very tutorial-focused,
+non-production manner. This means that there is very little
+error-checking/handling going on, with brevity and readability favoured over
+other options that might be more performant and/or scalable. The code is
+available as a reference, and should not be taken as an indicator of what good
+robust code shipped to end-users should look like.
+
+
+# Motivation #
+
+## Why not use CEP instead? ##
+
+If you've had any experience working with Photoshop development before, you'll
+likely be familar with the [Adobe CEP framework](https://github.com/Adobe-CEP),
+which is basically's Adobe idea of allowing developers to extend Photoshop
+through the "modern" set of web technologies, and being able to share those
+creations across the entire Adobe suite.
+
+Unfortunately (as with most over-complicated things in programming), while this
+sounds very nice in theory, it's an unmitigated disaster in practice. While I'll
+explain in detail later on, here's a brief list of bullet points:
+
+* For reasons which will be explained later, CEP is _slow_. It's to the point
+  where for certain operations (not even at scale), it's so slow in execution as
+  to be unusable (e.g. try checking which layers are locked in a document with
+  >200 layers.)
+
+* Debugging the CEP JavaScript/Adobe JSX layers is incredibly time-consuming and
+  sometimes also impossible, depending on the exposed API calls you're
+  attempting to make. Also, if there's a bug in the CEP/JS layer itself, you
+  likely will have no chance of solving it on your own without Adobe's help (and
+  good luck with that!). On the compiled side of things, as you'll see later on,
+  there's some seemingly insurmountable problems that _can_ be solved with a bit
+  of ingenuity.
+
+* It's JavaScript. Which probably sounded like a good idea to some product
+  manager back in the day, but now just serves to be a major pain even when
+  programming in it under normal circumstances. I'll take having an optimizing
+  compiler over a JIT language any day, thank you very much.
+
+
+# Requirements #
+
+This tutorial will focus on writing only the Windows version of any plugins,
+since Photoshop is only supported on Windows/OSX and really, the concepts I'm
+going to illustrate are OS-agnostic. However, in the event that I find it useful
+to cover information regarding those platforms, it will appear in the following
+format:
+
+!!! tip Crossing the platforms
+    Platform-specific information goes here.
+
+
+## What you will need ##
+
+- Windows 10 and Photoshop CC 2019/2020 or later.
+
+- A **C/C++ development environment** set up and ready to go. (If you want to see
+  what my Emacs setup looks like, it's
+  available [here](https://github.com/sonictk/lightweight-emacs).)
+
+- MSVC 2017 (Photoshop CC 2019/2020).
+
+!!! warning MSVC Compiler versions
+    You should use the recommended MSVC compiler that Photoshop was built with.
+    Information on this is available in the SDK documentation, under:
+    `pluginsdk/documentation/html/buildinfo.html`.
+
+- The Adobe Photoshop SDK for your particular version of Photoshop.
+  They can be downloaded from the following location:
+  https://console.adobe.io/downloads (You'll need an Adobe account.)
+  Versions prior to CC 2014 may be downloaded from the following
+  location: https://www.adobe.com/devnet/photoshop/sdk.html
+
+- The Adobe CEP SDK for your particular version of Photoshop. This can also be
+  downloaded from the [same earlier location](https://console.adobe.io/downloads)
+  as the Photoshop SDK.
+
+
+## What you should know ##
+
+- **Competency with C/C++**. This tutorial will not focus on basics, and is
+  meant to be more of a quickstart guide for programmers already experienced
+  with C++ to dive into the specifics of Photoshop plugin development.
+
+- **Basic knowledge of JavaScript**. We will be writing a little JavaScript code
+  here and there (simply to demonstrate usage of CEP, since that is still to
+  date the only officially recommended way to create GUIs in Photoshop), so
+  you'll need to be able to grok the syntax.
+
+- **Basic knowledge of Photoshop**. Since we're going to be writing plugins for
+  it, it would be helpful if you knew what a layer was, for example, or what
+  a filter is.
+
+Let's get started with the various recipes. Feel free to skip ahead if you're
+not interested in a particular topic.
+
+
+# Recipe: Minimalist approach to Photoshop plug-ins #
+
+This recipe will teach you how to create a native C++ Photoshop plugin from
+scratch and without involving an IDE; this will be as minimalist a
+setup as possible.
+
+## Getting the documentation ##
+
+The documentation for the Photoshop SDK is fairly old and hasn't been
+updated regularly in a while, but it's still useful in some ways. Your
+copy of the documentation (`documentation.html`) is included in the
+SDK that you downloaded.
+
+For initial reading, find the page on **Types of plug-in modules** and
+go over the different types of Photoshop plug-ins that are supported,
+and their corresponding limitations. Basically, Photoshop segregates
+the different types of plug-ins that one can write to extend the
+functionality of the host program, and each type of plug-in has a
+different entry point that Photoshop is expecting to call, along with
+a different defined file extension.
+
+For example, **filter** plug-ins (the kind that show up in the
+**Filter** menu, which basically run math operations on your layer's
+image pixels) have the entry point signature of:
+
+~~~~~~
+DLLExport MACPASCAL void PluginMain(const int16_t selector,
+                                    FilterRecordPtr filterRecord,
+                                    long long *data,
+                                    int16_t *result);
+~~~~~~
+
+and a file extension of `.8bf`, whereas **automation** plug-ins have
+a different entry point that Photoshop calls:
+
+~~~~~~
+DLLExport SPAPI SPErr AutoPluginMain(const char* caller,
+                                     const char* selector,
+                                     void* message);
+~~~~~~
+
+and a file extension of `.8li` instead.
+
+If you're attempting to write one of the other types of plugins, I
+suggest taking a look at the sample code, also provided with the
+documentation.
+
+## Hello, world ##
+
+Let's go ahead and create our first Photoshop plugin. To make things
+simple, we'll be making an **Automation** plug-in, which is generally
+meant for tools or other, as the name implies, automated processes to
+occur on Photoshop documents.
+
+You can refer to the various samples within the SDK to see more about
+Automation plugins in general, but for the purposes of this tutorial,
+go ahead and create `tutorial_automation_main.cpp`, and fill it with
+the following code:
+
+
+~~~~~~cpp
+SPBasicSuite *sSPBasic = NULL;
+
+
+SPErr UninitializePlugin()
+{
+    PIUSuitesRelease();
+    return status;
+}
+
+
+DLLExport SPAPI SPErr AutoPluginMain(const char* caller,
+                                     const char* selector,
+                                     void* message)
+{
+    SPErr status = kSPNoError;
+
+    SPMessageData *basicMessage = (SPMessageData *)message;
+
+    sSPBasic = basicMessage->basic;
+
+    if (sSPBasic->IsEqual(caller, kSPInterfaceCaller)) {
+        if (sSPBasic->IsEqual(selector, kSPInterfaceAboutSelector)) {
+            DoAbout(basicMessage->self, AboutID);
+        }
+
+        if (sSPBasic->IsEqual(selector, kSPInterfaceStartupSelector)) {
+            return kSPNoError;
+        }
+
+        if (sSPBasic->IsEqual(selector, kSPInterfaceShutdownSelector)) {
+            status = UninitializePlugin();
+        }
+    }
+
+    if (sSPBasic->IsEqual(caller, kPSPhotoshopCaller)) {
+        if (sSPBasic->IsEqual(selector, kPSDoIt)) {
+            PSActionsPlugInMessage *tmpMsg = (PSActionsPlugInMessage *)message;
+        }
+    }
+
+    return status;
+}
+~~~~~~
+While things here should be fairly self-explanatory, I'll go over a couple of
+slightly important bits that are useful to keep in mind as you continue
+development:
+
+~~~~~~cpp
+SPBasicSuite *sSPBasic = NULL;
+~~~~~~
+
+
+This seems rather innocuous, but is actually required; it's used for the
+new/delete operators that are used whenever you accquire or release what Adobe
+refers to as **suites**. Suites are essentially libraries of functionality that
+are specific to a product i.e. Photoshop would have its own suite, along with
+Illustrator. As mentioned, you accquire and release suites whenever you use the
+functionality from a specific suite.
+
+In this case, we release the suite when we unload the plugin, in the
+`UninitializePlugin` call.
+
+The next few lines of code are also fairly straightforward:
+
+~~~~~~cpp
+    SPMessageData *basicMessage = (SPMessageData *)message;
+
+    sSPBasic = basicMessage->basic;
+
+    if (sSPBasic->IsEqual(caller, kSPInterfaceCaller)) {
+        if (sSPBasic->IsEqual(selector, kSPInterfaceAboutSelector)) {
+            DoAbout(basicMessage->self, AboutID);
+        }
+
+        if (sSPBasic->IsEqual(selector, kSPInterfaceStartupSelector)) {
+            return kSPNoError;
+        }
+
+        if (sSPBasic->IsEqual(selector, kSPInterfaceShutdownSelector)) {
+            status = UninitializePlugin();
+        }
+    }
+
+    if (sSPBasic->IsEqual(caller, kPSPhotoshopCaller)) {
+        if (sSPBasic->IsEqual(selector, kPSDoIt)) {
+            PSActionsPlugInMessage *tmpMsg = (PSActionsPlugInMessage *)message;
+        }
+    }
+~~~~~~
+
+When Photoshop calls our `AutoPluginMain` entry point, you can see that it
+passes in a `message` parameter. This message is basically used to tell the
+plugin what context it's being called in, and thus allow the plugin to react
+accordingly. So we see that we check against `kSPInterfaceAboutSelector`,
+`kSPInterfaceStartupSelector`, `kSPInterfaceShutdownSelector`, and
+`kPSPhotoshopCaller` in order to decide what to do (where, of course, that last
+one means that the user just activated the plug-in from the Automation menu in
+the Photoshop UI). Nothing should be too mystical or obtuse here.
+
+You'll notice here that we actually haven't done any code that will do printing
+of "Hello world" or anything of the sort yet. That's because Photoshop is not a
+console application on Windows, and thus we won't actually see anything if we
+just `printf` our way around. So for now, let's just write some simple code to
+launch a message dialog with the necessary text:
+
+~~~~~~cpp
+#include <SPBasic.h>
+#include <SPInterf.h>
+
+#include <PIActionsPlugin.h>
+#include <PIUtilities.h>
+
+#include <Windows.h>
+#include <string.h>
+#include <assert.h>
+
+#include <DialogUtilitiesWin.cpp>
+#include <PIDLLInstance.cpp>
+#include <PIUSuites.cpp>
+#include <PIUtilities.cpp>
+#include <PIUtilitiesWin.cpp>
+#include <PIWinUI.cpp>
+
+
+#define WIN32_MAX_CLASS_NAME_LENGTH 256
+
+SPBasicSuite *sSPBasic = NULL;
+HWND globalPSMainWindowHwnd = NULL;
+
+
+BOOL CALLBACK getPSMainWindowCB(HWND hwnd, LPARAM lParam)
+{
+    char windowClassName[WIN32_MAX_CLASS_NAME_LENGTH];
+    GetClassNameA(hwnd, (LPSTR)windowClassName, WIN32_MAX_CLASS_NAME_LENGTH);
+
+    if (strncmp(windowClassName, "Photoshop", WIN32_MAX_CLASS_NAME_LENGTH) == 0) {
+        globalPSMainWindowHwnd = hwnd;
+    }
+
+    return TRUE;
+}
+
+
+SPErr UninitializePlugin()
+{
+    PIUSuitesRelease();
+    return status;
+}
+
+
+DLLExport SPAPI SPErr AutoPluginMain(const char* caller,
+                                     const char* selector,
+                                     void* message)
+{
+    SPErr status = kSPNoError;
+
+    SPMessageData *basicMessage = (SPMessageData *)message;
+
+    sSPBasic = basicMessage->basic;
+
+    if (sSPBasic->IsEqual(caller, kSPInterfaceCaller)) {
+        if (sSPBasic->IsEqual(selector, kSPInterfaceAboutSelector)) {
+            DoAbout(basicMessage->self, AboutID);
+        }
+
+        if (sSPBasic->IsEqual(selector, kSPInterfaceStartupSelector)) {
+            return kSPNoError;
+        }
+
+        if (sSPBasic->IsEqual(selector, kSPInterfaceShutdownSelector)) {
+            status = UninitializePlugin();
+        }
+    }
+
+    if (sSPBasic->IsEqual(caller, kPSPhotoshopCaller)) {
+        if (sSPBasic->IsEqual(selector, kPSDoIt)) {
+            PSActionsPlugInMessage *tmpMsg = (PSActionsPlugInMessage *)message;
+            BOOL status = EnumWindows(getPSMainWindowCB, (LPARAM)NULL);
+            assert(status != 0);
+            MessageBoxA(globalPSMainWindowHwnd, "Hello World!", "Tutorial Dialog", MB_OK|MB_ICONINFORMATION);
+        }
+    }
+
+    return status;
+}
+~~~~~~
+
+So the code exploded a little bit, but none of this should be unfamilar to
+anyone who's written Win32 code before; we basically enumerate the open windows
+of the desktop to see which window matches the Photoshop one (since Photoshop
+disallows itself from running multiple instances, this hack works fine**, and
+launch a message dialog with our text.
+
+Ok, so far the code is fairly straightforward. Now what combination of compiler
+flags and post-build steps do we need to make this a DLL that Photoshop can load?
+
+## Overview of the build process ##
+
+Before we start writing the build script, there's a few wrenches in the works
+that Adobe has thrown in when it comes to building our plug-in. Here's the
+summary of what you'll need to do in order to get your plug-in to load in Photoshop,
+illustrated in the diagram below:
+
+********************************************************************
+*  +---------------------+                                         *
+*  |                     |   (C code that just tells Photoshop     *
+*  |    PiPL source file |  how to load your plug-in and other     *
+*  |                     |  metadata associated with it)           *
+*  +----------+----------+                                         *
+*             |                                                    *
+*             |  preprocessor (MSVC)                               *
+*             |                                                    *
+*             |                                                    *
+*  +----------v------------+                                       *
+*  |                       |                                       *
+*  |    .rr file           |                                       *
+*  |                       |         (Your actual plug-in code)    *
+*  +-----------+-----------+                                       *
+*              |                     +----------------------+      *
+*              | Cvntpipl.exe        |                      |      *
+*              |                     |    .c/.cpp source(s) |      *
+*              |                     |                      |      *
+*  +-----------v------------+        +-----------+----------+      *
+*  |                        |                    |                 *
+*  | .rc Windows Resource   |                    |                 *
+*  |        script          |                    |  MSVC compiles  *
+*  +-----------+------------+                    |                 *
+*              |                                 |                 *
+*              | Resource Compiler               |                 *
+*              |   (rc.exe)          +-----------v-----------+     *
+*              |                     |                       |     *
+*  +-----------v------------+        |       .obj files      |     *
+*  |                        |        |                       |     *
+*  |   .res resource file   |        +------------+----------+     *
+*  |                        |                     |                *
+*  +----------+-------------+                     |                *
+*             |                                   |                *
+*             |                                   |                *
+*             +-----------------+-----------------+                *
+*                               |                                  *
+*                               |   MSVC linker                    *
+*              +----------------v------------------+               *
+*              |                                   |               *
+*              |   DLL plug-in (.8li, .8bf etc)    |               *
+*              | that actually gets loaded into PS |               *
+*              +-----------------+-----------------+               *
+*    +----------------------+    |                                 *
+*    |                      |    |                                 *
+*    |  .p12 certificate    +----+   ZXPSignCmd.exe                *
+*    +----------------------+    |                                 *
+*                                |                                 *
+*               +----------------v-------------------+             *
+*               |                                    |             *
+*               |      .zxp archive                  |             *
+*               | that actually gets distributed     |             *
+*               +------------------------------------+             *
+*                                                                  *
+********************************************************************
+[Figure [diagram]: An overview of what it takes to create a Photoshop plug-in.]
+
+It's rather involved, as you can see, which is unfortunate. You'll also notice
+that I reference some executables which are probably unfamiliar, notably
+`Cvntpipl.exe` and `ZXPSignCmd.exe`. The former is available in the Photoshop
+SDK, while the latter is available in the CEP SDK. I won't go into a discussion
+of _why_ things are this way; for now, we'll just accept it as a by-product of
+Photoshop's legacy.
+
+(Also because if I _did_ go into a discussion about it, I'd probably never
+finish writing this document.)
+
+There's also something here that might seem unfamilar, namely the PiPL
+properties file and `.res` resource file that the **Resource Compiler** creates.
+Shorthand for **Plug-in Property Lists**, the former is basically a C file that
+contains various types of information about your plug-in (i.e. what type of
+plug-in it is, who the author is, how Photoshop should load it), that eventually
+gets transformed into a `.res` resource file and then built into the final DLL
+through the (needlessly convoluted) steps listed above. Really, the entire
+branch on the left is all about just adding plug-in metadata so that Photoshop
+knows how to treat our plug-in. That's it.
+
+!!! tip Crossing the platforms
+    On OSX, you'll make use of [Rez](https://www.unix.com/man-page/osx/1/Rez/)
+    to compile the PiPL file instead. I'll not be covering it in this tutorial,
+    since the steps are essentially the same, just using different OS tools to
+    get the job done.
+
+## Writing the PiPL ##
+
+So what exactly does a PiPL file look like, then? Luckily, the samples included
+in the documentation provide most of the starting points we need. First, let's
+define some globals in a file called `tutorial_automation_globals.h`:
+
+~~~~~~cpp
+#define TUTORIAL_AUTOMATION_PLUGINNAME "AutomationTutorial"
+#define TUTORIAL_AUTOMATION_PLUGINDESC "An example automation plug-in for Adobe Photoshop."
+#define TUTORIAL_AUTOMATION_UUID "267c8093-d35c-4fb7-b0ae-7b224c7fc1ce"
+#define TUTORIAL_AUTOMATION_RESOURCE_ID 18601
+#define TUTORIAL_AUTOMATION_SUITE_ID 'exam'
+#define TUTORIAL_AUTOMATION_CLASS_ID TUTORIAL_AUTOMATION_SUITE_ID
+#define TUTORIAL_AUTOMATION_EVENT_ID 'ExAm'
+#define TUTORIAL_AUTOMATION_VENDORNAME "memyselfandi"
+~~~~~~
+
+You can generate the UUID using any tool of your choice. On Windows, you can
+use ``uuidgen.exe``.
+
+The PiPL resource file then follows, like so:
+
+~~~~~~cpp
+#include "PIDefines.h"
+#include "tutorial_automation_globals.h"
+
+#ifdef __PIMac__
+    #include "PIGeneral.r"
+    #include "PIUtilities.r"
+#elif defined(__PIWin__)
+    #define Rez
+    #include "PIGeneral.h"
+    #include "PIUtilities.r"
+#endif
+
+#include "PITerminology.h"
+#include "PIActions.h"
+
+resource 'PiPL' ( TUTORIAL_AUTOMATION_RESOURCE_ID, TUTORIAL_AUTOMATION_PLUGINNAME, purgeable)
+    {
+        {
+        Kind { Actions },
+        Name { TUTORIAL_AUTOMATION_PLUGINNAME },
+        Category { "AdobeSDK" },
+        Version { (latestActionsPlugInVersion << 16) | latestActionsPlugInSubVersion },
+
+        Component { ComponentNumber, TUTORIAL_AUTOMATION_PLUGINNAME },
+
+        #ifdef __PIMac__
+            CodeMacIntel64 { "AutoPluginMain" },
+        #else
+            #if defined(_WIN64)
+                CodeWin64X86 { "AutoPluginMain" },
+            #else
+                CodeWin32X86 { "AutoPluginMain" },
+            #endif
+        #endif
+
+        EnableInfo { "true" },
+
+        HasTerminology
+            {
+            TUTORIAL_AUTOMATION_CLASS_ID,
+            TUTORIAL_AUTOMATION_EVENT_ID,
+            TUTORIAL_AUTOMATION_RESOURCE_ID,
+            TUTORIAL_AUTOMATION_UUID
+            },
+
+        Persistent{},
+
+        // Only relevant if Persistent is set.
+        Messages
+        {
+            startupRequired,
+            doesNotPurgeCache,
+            shutdownRequired,
+            acceptProperty
+        },
+        }
+    };
+
+//-------------------------------------------------------------------------------
+//  Dictionary (scripting) resource
+//-------------------------------------------------------------------------------
+resource 'aete' (TUTORIAL_AUTOMATION_RESOURCE_ID, TUTORIAL_AUTOMATION_PLUGINNAME " dictionary", purgeable)
+    {
+    1, 0, english, roman,                   /* aete version and language specifiers */
+        {
+        TUTORIAL_AUTOMATION_VENDORNAME,                             /* vendor suite name */
+        TUTORIAL_AUTOMATION_PLUGINDESC,         /* optional description */
+        TUTORIAL_AUTOMATION_SUITE_ID,   /* suite ID */
+        1,                                  /* suite code, must be 1 */
+        1,                                  /* suite level, must be 1 */
+            {                               /* structure for automation */
+            TUTORIAL_AUTOMATION_PLUGINNAME,         /* name */
+            TUTORIAL_AUTOMATION_PLUGINDESC,         /* optional description */
+            TUTORIAL_AUTOMATION_CLASS_ID,       /* class ID, must be unique or Suite ID */
+            TUTORIAL_AUTOMATION_EVENT_ID,       /* event ID, must be unique */
+
+            NO_REPLY,                       /* never a reply */
+            IMAGE_DIRECT_PARAMETER,             /* direct parameter, used by Photoshop */
+                {                           // filter or selection class here:
+                }
+            },
+            {},     /* non-filter/automation plug-in class here */
+            {}, /* comparison ops (not supported) */
+            { // Enumerations go here:
+            }   /* end of any enumerations */
+        }
+    };
+~~~~~~
+The eagle-eyed (or incredibly bored) viewer might have noticed the addition of
+the lines:
+
+~~~~~~cpp
+        EnableInfo { "true" },
+
+        ...
+
+        Persistent{},
+
+        // Only relevant if Persistent is set.
+        Messages
+        {
+            startupRequired,
+            doesNotPurgeCache,
+            shutdownRequired,
+            acceptProperty
+        },
+~~~~~~
+
+The former basically disables the plugin in the menu unless an actual Photoshop
+document is currently open (which is nice sometimes, as you don't want to trick
+users into thinking that they can execute when they actually can't). The latter
+basically allows us to keep the plug-in loaded into memory on startup (which is
+what I usually do, since I initialize a bunch of things the moment my plugin
+loads into Photoshop.) You can omit this if you'd like.
+
+## Package signing ##
+
+There's another optional step after building the plug-in that also involves
+something called a `.p12` certificate, which is used by `ZXPSignCmd.exe`. What
+exactly is that? If we take a look at
+the [documentation](https://wwwimages2.adobe.com/content/dam/acom/en/devnet/creativesuite/pdfs/SigningTechNote_CC.pdf),
+we see that it's basically Adobe's way of allowing developers to certify that
+their code has not been altered before being deployed to end-users (presumably
+because most extensions are written in JSX/JavaScript and people are scared
+about that sort of thing? Who knows.) Either way, this means that you'll need to
+generate one of these certifcates as well if you want to be able to deploy your
+extension to other end-users through the Extension Manager or Adobe marketplace.
+
+If you actually just want to make a DLL and deploy it to end-users manually (by
+copying and pasting the plug-in to the appropriate location), then you can skip
+this step entirely.
+
+### Generating a certificate ###
+
+To generate the certificate, we'll make a self-signed one for now. You can, of
+course, pay money to a Certificate Authority (CA) and get one there, but for
+personal usage, a self-signed one will suffice. Thankfully, we can do this as
+well using the `ZXPSignCmd.exe` tool. From the [documentation](https://github.com/Adobe-CEP/Getting-Started-guides/tree/master/Package%20Distribute%20Install#acquiring-a-signed-certificate):
+
+~~~~~~batch
+ZXPSignCmd -selfSignedCert <countryCode> <stateOrProvince> <organization> <commonName> <password> <outputPath.p12> [options]
+~~~~~~
+
+You will then get a `.p12` file which you can for creating your packaged native
+extension later on.
+
+
+## Writing the build script ##
+
+Create a new file called `build.bat`, and let's get started writing up the
+previous diagram into code:
+
+~~~~~~batch
+@echo off
+setlocal
+
+set PhotoshopSDKRoot=C:\Users\sonict\src\thirdparty\adobe\cc2019\photoshop\pluginsdk
+set PhotoshopPluginsDeployPath=C:\Users\sonictk\psplugins
+
+set ZXPSignCmdExe=C:\Users\sonictk\Git\adobe\CEP-Resources\ZXPSignCMD\4.0.7\win64\ZXPSignCmd.exe
+set ZXPCert=C:\Users\sonictk\cert.p12
+set ZXPCertPassword=password123
+
+call "%vs2017installdir%\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+set BuildDir=%~dp0msbuild
+if not exist %BuildDir% mkdir %BuildDir%
+pushd %BuildDir%
+~~~~~~
+
+Yes, I'm putting the signing password into the build script since the
+certificate is self-signed and of no practical use in terms of being a security
+device. For now, let's just move on and set up the compiler flags we're going to use.
+
+~~~~~~batch
+set ProjectName=tutorial_automation
+
+set EntryPoint=%~dp0src\%ProjectName%_main.cpp
+set ResourcePiPL=%~dp0src\%ProjectName%_pipl.r
+set ResourceRC=%BuildDir%\%ProjectName%_pipl.rc
+set ResourceRES=%BuildDir%\%ProjectName%_pipl.res
+
+set ThirdPartyDirPath=%~dp0..\thirdparty
+
+set OutBin=%BuildDir%\%ProjectName%.8li
+
+set CommonLinkerFlags=/dll /incremental:no /machine:x64 /nologo /defaultlib:Kernel32.lib /defaultlib:User32.lib /defaultlib:Shell32.lib /nodefaultlib:LIBCMTD.lib /nodefaultlib:LIBCMT.lib "%ResourceRES%"
+set DebugLinkerFlags=%CommonLinkerFlags% /opt:noref /debug /pdb:"%BuildDir%\%ProjectName%.pdb"
+set ReleaseLinkerFlags=%CommonLinkerFlags% /opt:ref
+set RelWithDebInfoLinkerFlags=%CommonLinkerFlags% /opt:ref /debug /pdb:"%BuildDir%\%ProjectName%.pdb"
+
+set PSPreprocessorDefines=/DISOLATION_AWARE_ENABLED=1 /DWIN32=1 /D_CRT_SECURE_NO_DEPRECATE /D_SCL_SECURE_NO_DEPRECATE /D_WINDOWS /D_USRDLL /D_WINDLL /D_MBCS
+set PSCompilerFlags=/EHsc
+set CommonIncludePaths=/I "%ThirdPartyDirPath%" /I "%ThirdPartyDirPath%\psapi\common\includes" /I "%ThirdPartyDirPath%\psapi\common\resources" /I "%ThirdPartyDirPath%\psapi\common\sources" /I "%ThirdPartyDirPath%\psapi\photoshop" /I "%ThirdPartyDirPath%\psapi\pica_sp" /I "%ThirdPartyDirPath%\psapi\resources" /I "%ThirdPartyDirPath%\psapi\ai" /I "%BuildDir%"
+set CommonCompilerFlags=/nologo /W3 /WX %CommonIncludePaths% /Zc:__cplusplus /arch:AVX2 %PSCompilerFlags% %PSPreprocessorDefines%
+set CompilerFlagsDebug=%CommonCompilerFlags% /Od /Zi /D_DEBUG /MDd
+set CompilerFlagsRelease=%CommonCompilerFlags% /Ox /DNDEBUG /MD
+set CompilerFlagsRelWithDebInfo=%CommonCompilerFlags% /Ox /Zi /DNDEBUG /MD
+~~~~~~
+
+You can see that we have a bunch of extra preprocessor defines in there, some of
+which might make no sense (or be even spurious). Leave it all be for now, and
+let's set up the compilation commands themselves.
+
+~~~~~~batch
+echo.
+echo Compiling resources (command follows below)...
+set ResourceRR=%BuildDir%\%ProjectName%_pipl.rr
+
+echo %BuildRRCommand%
+%BuildRRCommand% > "%ResourceRR%"
+if %errorlevel% neq 0 goto error
+
+echo.
+echo Converting PiPL to  Windows resource file format...
+%CnvtPiPLExePath% "%ResourceRR%" "%ResourceRC%"
+if %errorlevel% neq 0 goto error
+
+echo.
+echo Compiling Windows Resources...
+rc /v /fo "%ResourceRES%" "%ResourceRC%"
+if %errorlevel% neq 0 goto error
+
+echo.
+echo Compiling source files for automation filter (command follows below)...
+echo %BuildCommand%
+echo.
+echo Output from compilation:
+%BuildCommand%
+if %errorlevel% neq 0 goto error
+~~~~~~
+
+For Photoshop, there's one thing that helps us when it comes to deploying our
+extensions: the normal path where you're supposed to deploy extensions to is
+the `Plug-ins` folder located in your Photoshop installation directory
+(i.e. `%programfiles%\Adobe\Adobe Photoshop 2020\Plug-ins`). However, this
+directory is searched recursively for suitable plug-in files, along with
+following shortcuts as well. Thus, what I usually do is make a shortcut link in
+the folder itself to a deploy location (which is why we define
+`PhotoshopPluginsDeployPath` above), and just copy the plug-ins there, like so:
+
+~~~~~~batch
+echo.
+echo Deploying built binaries and symbols...
+copy /Y "%OutBin%"  "%PhotoshopPluginsDeployPath%"
+if %errorlevel% neq 0 goto error
+
+copy /Y "%BuildDir%\%ProjectName%.pdb" "%PhotoshopPluginsDeployPath%"
+if %errorlevel% neq 0 goto error
+~~~~~~
+
+We copy the `.pdb` file as well, since it'll help the MSVC debugger when we want
+to end up debugging the plug-in later on if there's a problem.
+
+Finally, we build and sign the `.zxp` extension package for deployment to
+end-users, and we're done with the build script!
+
+~~~~~~batch
+set OutZXP=%BuildDir%\%ProjectName%.zxp
+set BuildZXPCommand=%ZXPSignCmdExe% -sign "%~dp0msbuild" "%OutZXP%" "%ZXPCert%" %ZXPCertPassword%
+
+echo.
+echo Building ZXP Photoshop extension package (command follows below)...
+echo %BuildZXPCommand%
+
+%BuildZXPCommand%
+
+if %errorlevel% neq 0 goto error
+
+if %errorlevel% == 0 goto success
+
+
+:error
+echo.
+echo ***************************************
+echo *      !!! An error occurred!!!       *
+echo ***************************************
+goto end
+
+
+:success
+echo.
+echo ***************************************
+echo *    Build completed successfully.    *
+echo ***************************************
+goto end
+
+
+:end
+echo.
+echo Build script finished execution at %time%.
+popd
+
+endlocal
+
+exit /b %errorlevel%
+~~~~~~
+
+!!! tip
+    The full version of this build script is available in the accompanying code
+    repository for this tutorial.
+
+Run ``build.bat`` and wait for the process to spit out the `.8li` DLL.
+
+After you've made sure that you've deployed the plugin in a suitable location
+that Photoshop can find, go ahead and open Photoshop, then launch your plug-in
+from the Automation menu. You should see the following message box appear:
+
+***************************************
+*                                     *
+*   +--------------------------+---+  *
+*   |  Tutorial Dialog         | X |  *
+*   +--------------------------+---+  *
+*   |                              |  *
+*   |   -----                      |  *
+*   |  (  i  )  Hello World!       |  *
+*   |   -----                      |  *
+*   +------------------------------+  *
+*   |                 +----------+ |  *
+*   |                 |    OK    | |  *
+*   |                 +----------+ |  *
+*   +------------------------------+  *
+*                                     *
+***************************************
+
+Congratulations, you've just made your first native plug-in in Photoshop!
+
+## Debugging your plug-in ##
+
+Let's make sure we're able to debug our plug-in first before we get carried
+away. If you've been following along so far, run `build.bat debug` in order to
+generate a version of the `.8li` with optimizations disabled and an accompanying
+`.pdb` file generated alongside it as well.
+
+After that, launch Photoshop and Visual Studio. You should be able to attach to
+the Photoshop process, set a breakpoint, then run your Automation action; the
+breakpoint in Visual Studio should get triggered and allow you to step through
+your plug-in.
+
+!!! warning Threading in Photoshop plug-ins
+    Basically, **no**. The Photoshop API is **not thread-safe**, so threading in
+    plug-ins is generally not advisable. There's a whole host of other
+    restrictions that Adobe has laid out, which you can read in the FAQ section
+    of the SDK documentation. (`pluginsdk/documentation/html/faqs.html#a313`)
+
+Now that we have a basic build-deploy-debug workflow going, we can finally start
+to do something mildly useful with it.
+
+# Why bother with different Photoshop plug-in types? #
+
+So now that we have an Automation plug-in, I'd like to pause for a second and go
+over the various signatures of few various types of plug-in entry point types in
+Photoshop. We're now familiar with the **Automation** type of entry point:
+
+~~~~~~cpp
+DLLExport SPAPI SPErr AutoPluginMain(const char* caller,
+                                     const char* selector,
+                                     void* message)
+~~~~~~
+
+We see that it actually doesn't offer us that much to play with alone, since all
+we really get is just some very basic metadata about the caller of our plugin,
+and what ``selector`` case triggered the call (which is basically
+Photoshop-speak for what caused the caller to call our entry point in the first
+place). We don't get access to anything else here unless the rest of the
+Photoshop API exposes it to us. And once you start looking more at the
+documentation included in the SDK, you'll come to realize that the amount of
+functionality exposed to third-party developers (which is who we are) is, quite
+frankly, rather pitiful.
+
+In order to even access the data in the active Photoshop document, we'll need to
+consider other plug-in types instead. If you read the **Types of plug-in
+modules** page located in the Photoshop SDK documentation, you'll be able to see
+that each plug-in's entry point delivers more information to you so that you can
+make the appropriate data transformations. For example, if we wanted to write an
+exporter plug-in for Photoshop that exported our layers in the document to some
+custom data format for use in an engine or whatnot, we'd go ahead and make a
+**Export** type of plug-in:
+
+~~~~~~cpp
+DLLExport MACPASCAL void PluginMain (const int16 selector,
+                                     ExportRecordPtr exportParamBlock,
+                                     intptr_t *data,
+                                     int16 *result)
+~~~~~~
+
+If we take a look at what `ExportRecordPtr` gives us (in `PIExport.h`), we can
+see that it's a _ton_ of document data that could be of potential use to us
+(along with some stuff that's legacy/deprecated/reserved and that we shouldn't
+pay any attention to):
+
+~~~~~~cpp
+// Comments in original source file stripped for brevity.
+typedef struct ExportRecord
+    {
+
+    int32           serialNumber;
+    TestAbortProc   abortProc;
+    ProgressProc    progressProc;
+    int32           maxData;
+    int16           imageMode;
+    Point           imageSize;
+    int16           depth;
+    int16           planes;
+    Fixed           imageHRes;
+    Fixed           imageVRes;
+    LookUpTable         redLUT;
+    LookUpTable         greenLUT;
+    LookUpTable         blueLUT;
+    Rect            theRect;
+    int16           loPlane;
+    int16           hiPlane;
+    void *          data;
+    int32           rowBytes;
+    Str255              filename;
+    int16           vRefNum;
+    Boolean         dirty;
+    Rect            selectBBox;
+    OSType          hostSig;
+    HostProc        hostProc;
+    Handle          duotoneInfo;
+    int16           thePlane;
+    PlugInMonitor   monitor;
+    void *          platformData;
+    BufferProcs *   bufferProcs;
+    ResourceProcs *     resourceProcs;
+    ProcessEventProc processEvent;
+    DisplayPixelsProc displayPixels;
+    HandleProcs         *handleProcs;
+    ColorServicesProc colorServices;
+    GetPropertyProc     getPropertyObsolete;
+    AdvanceStateProc advanceState;
+    int16           layerPlanes;
+    int16           transparencyMask;
+    int16           layerMasks;
+    int16           invertedLayerMasks;
+    int16           nonLayerPlanes;
+    ImageServicesProcs *imageServicesProcs;
+    int16               tileWidth;
+    int16               tileHeight;
+    Point               tileOrigin;
+    PropertyProcs   *propertyProcs;
+    PIDescriptorParameters  *descriptorParameters;
+    Str255                  *errorString;
+    ChannelPortProcs *channelPortProcs;
+    ReadImageDocumentDesc *documentInfo;
+    SPBasicSuite    *sSPBasic;
+    void            *plugInRef;
+    int32           transparentIndex;
+    Handle          iCCprofileData;
+    int32           iCCprofileSize;
+    int32           canUseICCProfiles;
+    int32           lutCount;
+    int32       HostSupports32BitCoordinates;
+    int32       PluginUsing32BitCoordinates;
+    VPoint      imageSize32;
+    VRect       theRect32;
+    VRect       selectBBox32;
+    char            reserved [106]; /**< Reserved for future use. Set to zero */
+    }
+ExportRecord, *ExportRecordPtr;
+~~~~~~
+
+I'll leave you to read the comments in the original source file if you want to
+find out about everything you now have access to, but the most important member
+here (assuming you really were writing an exporter) is the `data` member, which
+contains the raw bytes that you're trying to transform. Of course, you could
+also take a look at the `documentInfo` pointer, which being a pointer to a
+`ReadImageDocumentDesc` structure gives you access to basically the entire
+Photoshop document's layers, channels, metadata, etc.
+
+My advice is to work out what exactly you're attempting to do with your plug-in,
+and then take a look at the documentation regarding various Photoshop plug-in
+types to see which might be most appropriate, while also referring to the SDK
+samples to see what each plug-in type has access to in terms of data that
+Photoshop exposes to it.
+
+# Recipe: Reading layer data through C++ #
+
+This recipe will focus on a very simple operation: reading layer data from a
+Photoshop document for each layer in the document, and then exporting separate
+images of these layers to disk. However, I'll also demonstrate (in a simpler
+fashion) one of the examples of combining a Photoshop Automation plug-in to
+execute a Filter plug-in, thus allowing an Automation plug-in to essentially
+trigger modifications on an existing open document's pixels.
+
+!!! tip Prerequisite knowledge
+    You should already be familar with making Automation plug-ins and building
+    Photoshop plug-ins in general. If not, read the first recipe of this
+    tutorial in Section [Recipe: Minimalist approach to Photoshop plug-ins].
+
+## Additional requirements ##
+
+Because we'll be writing JPG images to disk, I'll be making use of
+`stb_image_write.h` to handle that functionality (since this tutorial isn't
+about implementing a JPG format writer). You can get it from:
+
+https://github.com/nothings/stb/blob/master/stb_image_write.h
+
+Place that in a folder that you're including into your compilation settings, as
+per your build script.
+
+## The filter plug-in entry point ##
+
+I'll skip the research here and get to the point: we'll be utilizing a
+**Filter** plugin to accomplish this, since it gives us access to what we need
+in order to read the document pixels. If you take a look at the documentation to
+see what the entry point for one of those is like, it looks like this:
+
+~~~~~~cpp
+DLLExport MACPASCAL void PluginMain(const int16 selector,
+                                    FilterRecordPtr filterRecord,
+                                    intptr_t * data,
+                                    int16 * result)
+~~~~~~
+
+And if we look at what a `FilterRecordPtr` is in `PIFilter.h`, we see that it is
+also another ginormous struct with all the information we need (I've left the
+source unmodified this time with all the comments for quick reference, since
+we're _actually_ going to be working with this struct in this tutorial):
+
+~~~~~~cpp
+typedef struct FilterRecord
+    {
+
+    int32       serialNumber;       /**< \deprecated Formerly the host serial number.
+                                       The host now reports
+                                       zero for the \c serialNumber. Plug-ins should use
+                                       the @ref PropertySuite by using the @ref FilterRecord::propertyProcs callback, specifying
+                                       the property \c propSerialString2 to get the serial string. */
+
+    TestAbortProc   abortProc;      /**< A pointer to the \c TestAbortProc callback. */
+
+    ProgressProc    progressProc;   /**< A pointer the the \c ProgressProc callback. */
+
+    Handle      parameters;         /**< Parameters the plug-in can request from a user.
+                                         Photoshop initializes this handle to NULL at startup.
+                                         If the plug-in filter has any parameters that the user can
+                                         set, it should allocate a relocatable block in the
+                                         \c filterSelectorParameters handler, store the parameters
+                                         in the block, and store the block’s handle in this field. */
+
+    Point       imageSize;          /**< \deprecated Use \c BigDocumentStruct::imageSize32. The width and height
+                                         of the image in pixels. If the selection is floating, this field instead
+                                         holds the size of the floating selection.  */
+    int16       planes;             /**< The number of planes in the image. For version 4+ filters, this
+                                         field contains the total number
+                                         of active planes in the image, including alpha channels. The
+                                             image mode should be determined by looking at \c imageMode.
+                                             For version 0-3 filters, this field is equal to 3 if
+                                             filtering the RGB channel of an RGB color image, or 4 if
+                                             filtering the CMYK channel of a CMYK color image.
+                                             Otherwise it is equal to 1. */
+    Rect        filterRect;         /**< \deprecated Use \c BigDocumentStruct::filterRect32.
+                                         The area of the image to be filtered. This is the bounding
+                                         box of the selection, or if there is no selection, the
+                                         bounding box of the image. If the selection is not a perfect
+                                         rectangle, Photoshop automatically masks the changes to the
+                                         area actually selected (unless the plug-in turns off this
+                                         feature using autoMask). This allows most filters to ignore
+                                         the selection mask, and still operate correctly. */
+    PSRGBColor  background;         /**< \deprecated Use @ref FilterRecord::backColor. */
+    PSRGBColor  foreground;         /**< \deprecated Use @ref FilterRecord::foreColor. */
+    int32       maxSpace;           /**< \deprecated Use @ref FilterRecord::maxSpace64. */
+    int32       bufferSpace;        /**< \deprecated Use @ref FilterRecord::bufferSpace64. */
+    Rect        inRect;             /**< \deprecated Use \c BigDocumentStruct::inRect32.
+                                         The area of the input image to access. The plug-in should set
+                                         this field in the \c filterSelectorStart and
+                                         \c filterSelectorContinue handlers to request access to an
+                                         area of the input image. The area requested must be a subset
+                                         of the image’s bounding rectangle. After the entire
+                                         \c filterRect has been filtered, this field should be set to
+                                         an empty rectangle.  */
+    int16       inLoPlane;          /**< The first input plane to process next. The \c filterSelectorStart and
+                                         \c filterSelectorContinue handlers should set this field. */
+    int16       inHiPlane;          /**< The last input plane to process next. The \c filterSelectorStart and
+                                         \c filterSelectorContinue handlers should set this field.  */
+    Rect        outRect;            /**< \deprecated Use \c BigDocumentStruct::outRect32.
+                                         The area of the output image to access. The plug-in should set
+                                         this field in its \c filterSelectorStart and \c filterSelectorContinue
+                                         handlers to request access to an area of the output image.
+                                         The area requested must be a subset of \c filterRect. After
+                                         the entire \c filterRect has been filtered, this field
+                                         should be set to an empty rectangle.  */
+    int16       outLoPlane;         /**< The first output plane to process next. The \c filterSelectorStart
+                                         and \c filterSelectorContinue handlers should set this field.  */
+    int16       outHiPlane;         /**< The last output plane to process next. The \c filterSelectorStart and
+                                         \c filterSelectorContinue handlers should set this field. */
+
+    void *      inData;             /**< A pointer to the requested input image data. If more than
+                                         one plane has been requested (see \c inLoPlane and \c inHiPlane), the
+                                         data is interleaved. */
+    int32       inRowBytes;         /**< The offset between rows of the input image data.
+                                         The end of each row may or may not include pad bytes. */
+    void *      outData;            /**< A pointer to the requested output image
+                                         data. If more than one plane has been requested
+                                         (see \c outLoPlane and \c outHiPlane), the data is interleaved. */
+    int32       outRowBytes;        /**< The offset between rows of the output image data.
+                                         The end of each row may or may not include pad bytes. */
+
+    Boolean     isFloating;         /**< Indicates if the selection is floating. Set to TRUE if and only if
+                                         the selection is floating. */
+    Boolean     haveMask;           /**< Indicates if the selection has a mask. Set to true if and only if
+                                         non-rectangular area has been selected. */
+    Boolean     autoMask;           /**< Enables or disables auto-masking. By default, Photoshop
+                                         automatically masks any changes to the area actually selected.
+                                         If \c isFloating=FALSE, and \c haveMask=TRUE, the plug-in can
+                                         turn off this feature by setting this field to FALSE. It can
+                                         then perform its own masking. <br><br>
+                                         If the plug-in has set the PiPL bit \c writesOutsideSelection, this
+                                         will always be FALSE and the plug-in must supply its own mask, if
+                                         needed. */
+
+    Rect        maskRect;           /**< \deprecated Use \c BigDocumentStruct::maskRect32.
+                                         Provides a mask rectangle. If \c haveMask=TRUE, and the
+                                         plug-in needs access to the selection mask, the plug-in
+                                         should set this field in your \c filterSelectorStart and
+                                         \c filterSelectorContinue handlers to request access to an
+                                         area of the selection mask. The requested area must be a
+                                         subset of \c filterRect. This field is ignored if there is
+                                         no selection mask.  */
+    void *      maskData;           /**< A pointer to the requested mask data. The data is in the
+                                         form of an array of bytes, one byte per pixel of the selected
+                                         area. The bytes range from (0...255), where 0=no mask
+                                         (selected) and 255=masked (not selected).
+                                         Use \c maskRowBytes to iterate over the scan lines of the
+                                         mask. */
+    int32       maskRowBytes;       /**< The offset between rows of the mask data. */
+
+    FilterColor backColor;          /**< The current background color, in the
+                                         color space native to the image.*/
+    FilterColor foreColor;          /**< The current foreground color, in the
+                                         color space native to the image.*/
+    OSType      hostSig;            /**< The signature of the host, provided by the host.
+                                         The signature for Photoshop is signature is 8BIM. */
+    HostProc    hostProc;           /**< A pointer to a host-defined callback procedure. May be NULL. */
+
+    int16       imageMode;          /**< The mode of the image being filtered, for example, Gray Scale, RGB Color,
+                                         and so forth. See @ref ImageModes "Image Modes" for values. The \c filterSelectorStart
+                                         handler should return \c filterBadMode if it is unable to
+                                         process this mode of image. */
+    Fixed       imageHRes;          /**< The  horizontal resolution of the image in terms of
+                                         pixels per inch. These are fixed point numbers (16.16). */
+    Fixed       imageVRes;          /**< The vertical resolution of the image in terms of
+                                         pixels per inch. These are fixed point numbers (16.16). */
+    Point       floatCoord;         /**< \deprecated Use \c BigDocumentStruct::floatCoord32.
+                                         The coordinate of the top-left corner of the selection
+                                         in the main image’s coordinate space. */
+    Point       wholeSize;          /**< \deprecated Use \c BigDocumentStruct::wholeSize32.
+                                         The size in pixels of the entire main image.
+                                         */
+    PlugInMonitor   monitor;        /**< Monitor setup information for the host. */
+
+    void        *platformData;      /**< A pointer to platform specific data.
+                                         Not used under Mac OS. See PlatformData in PITypes.h. */
+    BufferProcs *bufferProcs;       /**< A pointer to the Buffer suite
+                                         if it is supported by the host, otherwise NULL.
+                                         See @ref BufferSuite. */
+    ResourceProcs *resourceProcs;   /**< A pointer to the Pseudo-Resource suite
+                                         if it is supported by the host, otherwise NULL.
+                                         See chapter @ref ResourceSuite. */
+    ProcessEventProc processEvent;  /**< A pointer to the \c ProcessEventProc callback
+                                         if it is supported by the host, otherwise NULL. */
+    DisplayPixelsProc displayPixels;/**< A pointer to the \c DisplayPixelsProc callback
+                                         if it is supported by the host, otherwise NULL.  */
+    HandleProcs     *handleProcs;       /**< A pointer to the Handle callback suite
+                                         if it is supported by the host, otherwise NULL.
+                                         See @ref HandleSuite. */
+
+    // New in 3.0.
+
+    Boolean         supportsDummyChannels;  /**< Indicates whether the host supports the plug-in
+                                             requesting nonexistent planes. (See
+                                             @ref dummyPlaneValue, @ref inPreDummyPlanes,
+                                             @ref inPostDummyPlanes, @ref outPreDummyPlanes,
+                                             @ref outPostDummyPlanes.) */
+    Boolean     supportsAlternateLayouts;   /**< Indicates whether the host support data layouts
+                                                 other than rows of columns of planes. This field
+                                                 is set by the plug-in host to indicate whether
+                                                 it respects the \c wantLayout field. */
+    int16       wantLayout;             /**< The desired layout for the data.
+                                         The plug-in host only looks at this field if it has also set
+                                         \c supportsAlternateLayouts. See @ref LayoutConstants "Layout Constants"
+                                         for values. */
+    int16       filterCase;             /**< The type of data being filtered. Flat, floating, layer
+                                         with editable transparency, layer with preserved transparency,
+                                         with and without a selection. A zero indicates that the host
+                                         did not set this field, and the plug-in should look at
+                                         \c haveMask and \c isFloating. See @ref FilterCaseIdentifiers for values. */
+    int16       dummyPlaneValue;    /**< The value to store into any dummy planes. Values from 0 to
+                                         255 indicates a specific value. A value of -1 indicates
+                                         to leave undefined. All other values generate an error. */
+
+    void *      premiereHook;       /**< \deprecated */
+
+    AdvanceStateProc advanceState;  /**< \c AdvanceState callback. */
+
+    Boolean         supportsAbsolute;   /**< Indicates whether the host supports absolute channel
+                                         indexing. Absolute channel indexing ignores visibility
+                                         concerns and numbers the channels from zero starting with
+                                         the first composite channel. If existing, transparency
+                                         follows, followed by any layer masks, then alpha channels. */
+
+    Boolean         wantsAbsolute;      /**< Enables absolute channel indexing for the input. This is
+                                         only useful if supportsAbsolute=TRUE. Absolute indexing
+                                         is useful for things like accessing alpha channels.  */
+    GetPropertyProc     getPropertyObsolete;    /**< The \c GetProperty callback. This direct callback
+                                                 pointer has been superceded by the Property callback
+                                                 suite, but is maintained here for backwards compatibility.
+                                                 See @ref PropertySuite. */
+    Boolean         cannotUndo;             /**< Indicates whether a filter plug-in makes changes that the user cannot undo.
+                                         If the filter makes a change that cannot be undone, then setting
+                                         this field to TRUE prevents Photoshop from offering undo
+                                         for the filter. This is rarely needed and usually frustrates
+                                         users.      */
+    Boolean         supportsPadding;    /**< Indicates whether the host supports requests outside the image
+                                         area. If so, see padding fields below. */
+
+    int16       inputPadding;       /**< Instructions for padding the input.
+                                         The input can be padded when loaded. See @ref FilterPadding
+                                         "Filter Padding Constants." \n\n
+                                         The options for padding include specifying a specific value
+                                         (0...255), specifying \c plugInWantsEdgeReplication, specifying
+                                         that the data be left random (\c plugInDoesNotWantPadding), or
+                                         requesting that an error be signaled for an out of bounds
+                                         request (\c plugInWantsErrorOnBoundsException). Default value:
+                                         \c plugInWantsErrorOnBoundsException. */
+    int16       outputPadding;      /**< Instructions for padding the output.
+                                         The output can be padded when loaded. See @ref FilterPadding
+                                         "Filter Padding Constants." \n\n
+                                         The options for padding include specifying a specific value
+                                         (0...255), specifying \c plugInWantsEdgeReplication, specifying
+                                         that the data be left random (\c plugInDoesNotWantPadding), or
+                                         requesting that an error be signaled for an out of bounds
+                                         request (\c plugInWantsErrorOnBoundsException). Default value:
+                                         \c plugInWantsErrorOnBoundsException. */
+    int16       maskPadding;        /**< Padding instructions for the mask.
+                                         The mask can be padded when loaded. See @ref FilterPadding
+                                         "Filter Padding Constants." \n\n
+                                         The options for padding include specifying a specific value
+                                         (0...255), specifying \c plugInWantsEdgeReplication, specifying
+                                         that the data be left random (\c plugInDoesNotWantPadding), or
+                                         requesting that an error be signaled for an out of bounds
+                                         request (\c plugInWantsErrorOnBoundsException). Default value:
+                                         \c plugInWantsErrorOnBoundsException. */
+    char        samplingSupport;    /**< Indicates whether the host support non- 1:1 sampling
+                                         of the input and mask. Photoshop 3.0.1+ supports
+                                         integral sampling steps (it will round up to get there).
+                                         This is indicated by the value #hostSupportsIntegralSampling.
+                                         Future versions may support non-integral sampling steps.
+                                         This will be indicated with #hostSupportsFractionalSampling. */
+    char        reservedByte;       /**< For alignment. */
+
+    Fixed       inputRate;          /**< The sampling rate for the input. The effective input
+                                         rectangle in normal sampling coordinates is
+                                         <code> inRect * inputRate. </code> For example,
+                                         <code> (inRect.top * inputRate,
+                                         inRect.left * inputRate, inRect.bottom * inputRate,
+                                         inRect.right * inputRate). </code> The value for
+                                         \c inputRate is rounded to the
+                                         nearest integer in Photoshop 3.0.1+. Since the scaled
+                                         rectangle may exceed the real source data, it is a good
+                                         idea to set some sort of padding for the input as well. */
+    Fixed       maskRate;           /**< Like \c inputRate, but as applied to the mask data. */
+
+    ColorServicesProc colorServices; /**< Function pointer to access color services routine. */
+
+    /* Photoshop structures its data as follows for plug-ins when processing
+       layer data:
+            target layer channels
+            transparency mask for target layer
+            layer mask channels for target layer
+            inverted layer mask channels for target layer
+            non-layer channels
+        When processing non-layer data (including running a filter on the
+        layer mask alone), Photoshop structures the data as consisting only
+        of non-layer channels.  It indicates this structure through a series
+        of short counts.  The transparency count must be either 0 or 1. */
+
+    int16       inLayerPlanes;        /**< The number of target layer planes for the input data.
+                                           If all the input plane values are zero,
+                                           then the plug-in should assume the host has not set them.
+                                           <br><br>
+                                           @note When processing layer data, Photoshop structures
+                                           its input and output data for plug-ins as follows:
+                                           - target layer channels
+                                           - transparency mask for target layer
+                                           - layer mask channels for target layer
+                                           - inverted layer mask channels for target layer
+                                           - non-layer channels
+
+                                           The output planes are a prefix of the input planes.
+                                           For example, in the protected transparency case, the input
+                                           can contain a transparency mask and a layer mask while the
+                                           output can contain just the layerPlanes.
+                                           <br><br>
+                                           When processing non-layer data (including running a filter
+                                           on the layer mask alone), Photoshop structures the data
+                                           as consisting only of non-layer channels.  It indicates
+                                           this structure through a series of short counts.  The
+                                           transparency count must be either 0 or 1.
+                                           */
+    int16       inTransparencyMask;       /**< The number of transparency masks for the input target
+                                           layer data.
+                                           See @ref inLayerPlanes for additional information. */
+    int16       inLayerMasks;         /**< The number of layer mask channels for the input
+                                           target layer.
+                                           See @ref inLayerPlanes for additional information.*/
+    int16       inInvertedLayerMasks; /**< The number of inverted layer mask channels for the
+                                           input target layer. <br>
+                                           With the inverted layer masks, 0 = fully visible
+                                           and 255 = completely hidden.  See @ref inLayerPlanes for
+                                           additional information.*/
+    int16       inNonLayerPlanes;     /**< The number of non-layer channels for the input data.
+                                           See @ref inLayerPlanes for additional information. */
+
+    int16       outLayerPlanes;           /**< The number of target layer planes for the output data.
+                                           See @ref inLayerPlanes for additional information about
+                                           the structure of the output data. */
+    int16       outTransparencyMask;  /**< The number of transparency masks for the output data.
+                                           See @ref inLayerPlanes for additional information about
+                                           the structure of the output data. */
+    int16       outLayerMasks;        /**< The number of layer mask channels for the output data.
+                                           See @ref inLayerPlanes for additional information about
+                                           the structure of the output data. */
+    int16       outInvertedLayerMasks; /**< The number of inverted layer mask channels for the output data.
+                                           See @ref inLayerPlanes for additional information about
+                                           the structure of the output data. */
+    int16       outNonLayerPlanes;     /**< The number of non-layer channels for the output data.
+                                           See @ref inLayerPlanes for additional information about
+                                           the structure of the output data. */
+
+    int16       absLayerPlanes;           /**< The number of target layer planes for the input data,
+                                           used for the structure of the input data when
+                                           \c wantsAbsolute is TRUE.
+                                           See @ref inLayerPlanes for additional information about
+                                           the structure of the input data. */
+    int16       absTransparencyMask;  /**< The number of transparency masks for the input data,
+                                           used for the structure of the input data when
+                                           \c wantsAbsolute is TRUE.
+                                           See @ref inLayerPlanes for additional information about
+                                           the structure of the input data. */
+    int16       absLayerMasks;       /**< The number of layer mask channels for the input data,
+                                           used for the structure of the input data when
+                                           \c wantsAbsolute is TRUE.
+                                           See @ref inLayerPlanes for additional information about
+                                           the structure of the input data. */
+    int16       absInvertedLayerMasks; /**< The number of inverted layer mask channels for the input
+                                           data, used for the structure of the input data when
+                                           \c wantsAbsolute is TRUE.
+                                           See @ref inLayerPlanes for additional information about
+                                           the structure of the input data. */
+    int16       absNonLayerPlanes;   /**< The number of target layer planes for the input data,
+                                           used for the structure of the input data when
+                                           \c wantsAbsolute is TRUE.
+                                           See @ref inLayerPlanes for additional information about
+                                           the structure of the input data. */
+
+    /* We allow for extra planes in the input and the output.  These planes
+       will be filled with dummyPlaneValue at those times when we build the
+       buffers.  These features will only be available if supportsDummyPlanes
+       is TRUE. */
+
+    int16       inPreDummyPlanes;   /**< The number of extra planes before
+                                         the input data. Only available if
+                                         \c supportsDummyChannels=TRUE. Used for
+                                         things like forcing RGB data to appear as RGBA.  */
+    int16       inPostDummyPlanes;  /**< The number of extra planes after
+                                         the input data. Only available if
+                                         \c supportsDummyChannels=TRUE. Used for
+                                         things like forcing RGB data to appear as RGBA.  */
+
+    int16       outPreDummyPlanes;  /**< The number of extra planes before
+                                         the output data. Only available if
+                                         \c supportsDummyChannels=TRUE. */
+    int16       outPostDummyPlanes;     /**< The number of extra planes after
+                                         the output data. Only available if
+                                         \c supportsDummyChannels=TRUE. */
+
+    /* If the plug-in makes use of the layout options, then the following
+       fields should be obeyed for identifying the steps between components.
+       The last component in the list will always have a step of one. */
+
+    int32       inColumnBytes;      /**< The step from column to column in the input.
+                                         If using the layout options, this value may change
+                                         from being equal to the number of planes. If zero,
+                                         assume the host has not set it. */
+    int32       inPlaneBytes;       /**< The step from plane to plane in the input. Normally 1,
+                                         but this changes if the plug-in uses the layout options.
+                                         If zero, assume the host has not set it. */
+
+    int32       outColumnBytes;         /**< The output equivalent of @ref inColumnBytes. */
+    int32       outPlaneBytes;      /**< The output equivalent of @ref inPlaneBytes. */
+
+    // New in 3.0.4
+
+    ImageServicesProcs *imageServicesProcs;
+                                    /**< Image Services callback suite. */
+
+    PropertyProcs   *propertyProcs;     /**< Property callback suite.  The plug-in needs to
+                                         dispose of the handle returned for     complex properties (the
+                                         plug-in also maintains ownership of handles for
+                                         set properties. */
+
+    int16       inTileHeight;       /**< Tiling height for the input, set by host. Zero if not set.
+                                         The plug-in should work at this size, if possible. */
+    int16       inTileWidth;        /**< Tiling width for the input, set by host. Zero if not set.
+                                         Best to work at this size, if possible. */
+    Point       inTileOrigin;       /**< Tiling origin for the input, set by host. Zero if not set. */
+
+    int16       absTileHeight;      /**< Tiling height the absolute data, set by host.
+                                         The plug-in should work at this size, if possible.*/
+    int16       absTileWidth;       /**< Tiling width the absolute data, set by host.
+                                         The plug-in should work at this size, if possible.*/
+    Point       absTileOrigin;      /**< Tiling origin the absolute data, set by host. */
+
+    int16       outTileHeight;      /**< Tiling height for the output, set by host.
+                                         The plug-in should work at this size, if possible. */
+    int16       outTileWidth;       /**< Tiling width for the output, set by host.
+                                         The plug-in should work at this size, if possible. */
+    Point       outTileOrigin;      /**< Tiling origin for the output, set by host.  */
+
+    int16       maskTileHeight;         /**< Tiling height for the mask, set by host.
+                                         The plug-in should work at this size, if possible. */
+    int16       maskTileWidth;      /**< Tiling width for the mask, set by host.
+                                         The plug-in should work at this size, if possible. */
+    Point       maskTileOrigin;         /**< Tiling origin for the mask, set by host. */
+
+    // New in 4.0
+
+    PIDescriptorParameters  *descriptorParameters;  /**< Descriptor callback suite.  */
+    Str255                  *errorString;   /**< An error reporting string to return to Photoshop.
+                                                 If the plug-in returns with result=errReportString then
+                                                 this string is displayed as:
+                                                 "Cannot complete operation because " + \c errorString. */
+
+    ChannelPortProcs *channelPortProcs;
+                                    /**< Channel Ports callback suite. */
+
+    ReadImageDocumentDesc *documentInfo;    /**< The Channel Ports document information
+                                                 for the document being filtered. */
+    // New in 5.0
+
+    SPBasicSuite    *sSPBasic;      /**< PICA basic suite.  Provides the mechanism to access all PICA suites. */
+    void            *plugInRef;         /**< Plug-in reference used by PICA. */
+
+    int32           depth;          /**< Bit depth per channel (1,8,16,32). */
+
+    // New in 6.0
+
+    Handle          iCCprofileData;     /**< Handle containing the ICC profile for the image. (NULL if none, read only)
+                                        Photoshop allocates the handle using its handle suite
+                                        The handle is unlocked while calling the plug-in.
+                                        The handle is valid from  \c FilterSelectorStart to \c FilterSelectorFinish
+                                        Photoshop will free the handle after \c FilterSelectorFinish. */
+
+    int32           iCCprofileSize;         /**< Size of profile. */
+
+    int32           canUseICCProfiles;  /**< Indicates if the host uses ICC Profiles.
+                                             If this is zero, do not dereference \c iCCprofileData.
+                                        */
+
+    // New in 7.0
+
+    int32           hasImageScrap;      /**< Indicates if Photoshop has image scrap; non-zero if it does.
+                                             The plug-in can ask for the
+                                             exporting of image scrap by setting the PiPL resource,
+                                             @ref PIWantsScrapProperty. The document info for the image scrap is
+                                             chained right behind the targeted document pointed by the
+                                             @ref documentInfo field. Photoshop sets \c hasImageScrap to indicate
+                                             that an image scrap is available. A plug-in can use it to tell whether
+                                             Photoshop failed to export the scrap because some unknown
+                                             reasons or there is no scrap at all. */
+
+    // New in 8.0
+
+    BigDocumentStruct   *bigDocumentData;   /**< Support for documents larger than 30,000 pixels.
+                                                NULL if host does not support big documents.*/
+
+    // New in 10.0
+
+    PIDescriptorParameters  *input3DScene;  /**< support for 3d scene data to be sent into the plug-in */
+
+    PIDescriptorParameters  *output3DScene;     /**< support for 3d scene to come out of the plug-in */
+
+    Boolean                     createNewLayer; /**< set by plug-in this only works for 3D layers */
+
+    // New in 13.0
+
+    Handle          iCCWorkingProfileData;  /**< Handle containing the ICC profile for the working
+                                            profile set via color settings dialog. (NULL if none)
+                                            Photoshop allocates the handle using its handle suite
+                                            The handle is unlocked while calling the plug-in.
+                                            The handle is valid from  \c FilterSelectorStart to \c FilterSelectorFinish
+                                            Photoshop will free the handle after \c FilterSelectorFinish. */
+
+    int32           iCCWorkingProfileSize;  /**< Size of working profile. */
+
+    // New in 18.0
+
+    int64           bufferSpace64;          /**< Allows the plug-in to specify how much buffer space it needs.
+                                            If the plug-in is planning on allocating any large internal
+                                            buffers or tables, it should set this field during the
+                                            \c filterSelectorPrepare call to the number of bytes it
+                                            plans to allocate.Photoshop then tries to free up the
+                                            requested amount of space before calling the
+                                            \c filterSelectorStart routine.Relocatable blocks should
+                                            be used if possible. */
+
+    int64           maxSpace64;                 /**< The maximum number of bytes of information the plug-in can
+                                            expect to be able to access at once (input area size + output area
+                                            size + mask area size + bufferSpace). Set by Photoshop. */
+
+    ///@name Reserved Space for Expansion
+    //@{
+    char        reserved [46];      /**< Reserved for future use. Set to zero. */
+    //@}
+
+    }
+FilterRecord, *FilterRecordPtr;
+~~~~~~
+
+Because our objective this time is to export the data from each and every
+separate layer in the document, we have to make use of the `documentInfo`
+pointer here, which will direct us to a struct like so:
+
+~~~~~~cpp
+typedef struct ReadImageDocumentDesc
+{
+
+    int32 minVersion;      /**< The minimum version needed to interpret this record. */
+    int32 maxVersion;      /**< The maximum version allowable to interpret this record. */
+
+    //---------------------------------------------------------------------------
+    //  Version 0 fields:
+    //---------------------------------------------------------------------------
+
+    int32 imageMode;        /**< Color mode for the document. See @ref ImageModes for supported modes. */
+    int32 depth;            /**< Default bit depth for the document. */
+    VRect bounds;           /**< Document bounds. */
+
+    Fixed hResolution;      /**< Horizontal resolution for the document. */
+    Fixed vResolution;      /**< Vertical resolution for the document. */
+
+    LookUpTable redLUT;         /**< Red color table, applicable when \c imageMode is indexed color or duotone. */
+    LookUpTable greenLUT;   /**< Green color table, applicable when \c imageMode is indexed color or duotone. */
+    LookUpTable blueLUT;    /**< Blue color table, applicable when \c imageMode is indexed color or duotone. */
+
+
+    ReadChannelDesc *targetCompositeChannels;   /**< Composite channels in the target layer. */
+
+    ReadChannelDesc *targetTransparency;       /**< Transparency channel for the target layer. */
+
+        ReadChannelDesc *targetLayerMask;          /**< Layer mask for the target channel. */
+
+    ReadChannelDesc *mergedCompositeChannels;  /**< Composite channels in the merged data. Merged
+                                                   data is either merged layer data or merged
+                                                   document data. */
+
+    ReadChannelDesc *mergedTransparency;       /**< Transparency channel for the merged data. */
+
+    ReadChannelDesc *alphaChannels;                /**< Alpha channels for masks */
+
+    ReadChannelDesc *selection;                    /**< Selection mask, if any. */
+
+    // New with version 1.
+    //---------------------------------------------------------------------------
+    //  Version 1 fields
+    //---------------------------------------------------------------------------
+    // New in version 1
+
+    struct SPPlatformFileSpecification_t *fileSpec;      /**<  The file specification, if any. */
+
+    // New in version 2
+
+    ReadLayerDesc *layersDescriptor;           /**< Descriptor for a linked list of layers, if any. */
+
+    int32 documentType;                            /**< Document type.  See @ref DocumentTypes "Document Types." */
+
+    struct ReadImageDocumentDesc *next;            /**< The next descriptor in the list. */
+
+    //---------------------------------------------------------------------------
+    //  Version 3 fields (added in Photoshop CS3/10)
+    //---------------------------------------------------------------------------
+
+    // New in version 3
+
+    void *  iCCprofileData;         /**< ICC Profile Data. NULL if there is no profile  */
+
+    int32   iCCprofileSize;         /**< Size of the ICC profile; zero if there is no profile. */
+
+    int32   compositeChannelCount;  /**< Number of composite color channels in this document. */
+
+    int32   layerCount;             /**< Total number of layers in this document;
+                                     ignores visbility, adjustments, etc.   */
+
+    int32   alphaChannelCount;  /**< Number of alpha channels in this document. */
+
+
+    //---------------------------------------------------------------------------
+    //  Version 4 fields (added in Photoshop CS3/10)
+    //---------------------------------------------------------------------------
+
+    // Layer mask for the target layer:
+    ReadChannelDesc *targetSmartFilterMask;
+
+    //---------------------------------------------------------------------------
+    //  Version 5 fields (added in Photoshop CS6/13)
+    //---------------------------------------------------------------------------
+
+    // The Unicode file specification, if any.
+    struct SPPlatformFileSpecificationW *fileSpecW;
+
+    //---------------------------------------------------------------------------
+    //  Version 6 fields (added in Photoshop CC 2015.5 (17.0))
+    //---------------------------------------------------------------------------
+    // The file specification, if any.
+    struct XPlatFileSpec *fileSpecX;
+
+
+  #ifdef __cplusplus
+    ReadImageDocumentDesc()
+        : minVersion(0), maxVersion(0), imageMode(0), depth(0),
+          hResolution(0), vResolution(0),
+          targetCompositeChannels(NULL), targetTransparency(NULL), targetLayerMask(NULL),
+          mergedCompositeChannels(NULL), mergedTransparency(NULL), alphaChannels(NULL),
+          selection(NULL), fileSpec(NULL), layersDescriptor(NULL), documentType(0),
+          next(NULL), iCCprofileData(NULL), iCCprofileSize(0), compositeChannelCount(0),
+          layerCount(0), alphaChannelCount(0), targetSmartFilterMask(NULL), fileSpecW(NULL),
+          fileSpecX(0)
+            {
+            }
+  #endif // __cplusplus
+
+} ReadImageDocumentDesc;
+~~~~~~
+We see that we have access to a linked list of layers in the document through
+the `layersDescriptor` pointer in this struct, which will be what we use to
+iterate through all the layers in the current Photoshop document.
+
+## Writing a filter plug-in ##
+
+Similar to how we wrote the automation filter, let's begin with the entry point
+and the necessary machinery around it. Create a new source file called
+`tutorial_filter_main.cpp` and fill it with the following:
+
+~~~~~~cpp
+#include <PIDefines.h>
+#include <PIAbout.h>
+#include <PIFilter.h>
+#include <SPBasic.h>
+
+
+SPBasicSuite *sSPBasic = NULL;
+
+
+void executeFilter(const FilterRecordPtr &filterRecord)
+{
+    // TODO: implement
+    return;
+}
+
+
+DLLExport MACPASCAL void PluginMain(const int16_t selector,
+                                    FilterRecordPtr filterRecord,
+                                    long long *data,
+                                    int16_t *result)
+{
+    switch (selector) {
+    case filterSelectorAbout:
+        sSPBasic = ((AboutRecord *)filterRecord)->sSPBasic;
+
+    case filterSelectorStart:
+    {
+        sSPBasic = filterRecord->sSPBasic;
+        if (filterRecord->bigDocumentData != NULL) {
+            filterRecord->bigDocumentData->PluginUsing32BitCoordinates = true;
+        }
+
+        executeFilter(filterRecord);
+
+        break;
+    }
+    default:
+        break;
+    }
+
+    return;
+}
+~~~~~~
+
+The code here isn't terribly interesting; basically, at our entry point, we case
+for whether the filter has been executed from the Photoshop menu, and if so, we
+check if the current document is considered a "big" document (i.e. a `.psb`
+document), set the `filterRecord` attribute as appropriate, and call our
+`executeFilter` function, which is currently stubbed out for now.
+
+!!! tip Large Photoshop documents VS standard ones
+    Recall that Photoshop has a very long history, and started out as a 32-bit
+    application. As demands grew, Photoshop documents started to balloon in
+    sizes, to the point where they were starting to brush up against both
+    filesystem limitations and the Photoshop engine as well. As such, Adobe
+    introduced the `.psb` large photoshop document format to complement the
+    existing `.psd` one. The format is essentially shared between the two, but
+    has some subtle differences. The
+    [Photoshop Document File Specification](https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/)
+    is a good reference for understanding what some of these differences are.
+
+We'll make some global definitions again for this new plug-in, of course, in a
+file called `tutorial_globals.h`:
+
+~~~~~~cpp
+#ifndef TUTORIAL_GLOBALS_H
+#define TUTORIAL_GLOBALS_H
+
+
+#define TUTORIAL_FILTER_PLUGINNAME "FilterTutorial"
+#define TUTORIAL_FILTER_PLUGINDESC "A filter plug in for Adobe Photoshop that retrieves pixel data info from the current document."
+#define TUTORIAL_FILTER_UUID "e02828c8-69af-4977-9294-b3221dbcec49"
+#define TUTORIAL_FILTER_RESOURCE_ID 18008
+#define TUTORIAL_FILTER_SUITE_ID 'Filt'
+#define TUTORIAL_FILTER_CLASS_ID TUTORIAL_FILTER_SUITE_ID
+#define TUTORIAL_FILTER_EVENT_ID 'filt'
+#define TUTORIAL_FILTER_VENDORNAME "memyselfandi"
+
+#define TUTORIAL_FILTER_TRIGGERNAME "trigger"
+#define TUTORIAL_FILTER_KEYTRIGGER 'Tgr '
+#define TUTORIAL_FILTER_TYPETRIGGER 'TTgr'
+#define TUTORIAL_FILTER_TRIGGERDESC "Activates the filter."
+
+#define TUTORIAL_FILTER_KEYRESULT 'Rslt'
+#define TUTORIAL_FILTER_TYPERESULT 'TRsl'
+
+#define TUTORIAL_FILTER_ENUMINFONAME "Info"
+#define TUTORIAL_FILTER_ENUMINFO 'Info'
+
+#endif
+~~~~~~
+
+The resource file (which we will call `tutorial_filter_pipl.r` for the sake of
+naming conventions) this time will look slightly different, but fairly similar to
+that of the Automation plug-in we made previously:
+
+~~~~~~cpp
+#include "PIDefines.h"
+#include "tutorial_globals.h"
+
+#ifdef __PIMac__
+    #include "PIGeneral.r"
+    #include "PIUtilities.r"
+#elif defined(__PIWin__)
+    #define Rez
+    #include "PIGeneral.h"
+    #include "PIUtilities.r"
+#endif
+
+#include "PITerminology.h"
+#include "PIActions.h"
+
+resource 'PiPL' ( TUTORIAL_FILTER_RESOURCE_ID, TUTORIAL_FILTER_PLUGINNAME, purgeable )
+{
+    {
+        Kind { Filter },
+        Name { TUTORIAL_FILTER_PLUGINNAME },
+        Version { (latestFilterVersion << 16) | latestFilterSubVersion },
+
+        Component { ComponentNumber, TUTORIAL_FILTER_PLUGINNAME },
+
+        #ifdef __PIMac__
+            CodeMacIntel64 { "PluginMain" },
+        #else
+            #if defined(_WIN64)
+                CodeWin64X86 { "PluginMain" },
+            #else
+                CodeWin32X86 { "PluginMain" },
+            #endif
+        #endif
+
+        EnableInfo { "true" },
+        HasTerminology { TUTORIAL_FILTER_CLASS_ID,
+                         TUTORIAL_FILTER_EVENT_ID,
+                         TUTORIAL_FILTER_RESOURCE_ID,
+                         TUTORIAL_FILTER_UUID },
+        FilterCaseInfo
+        {
+            {
+                inWhiteMat, outWhiteMat,
+                doNotWriteOutsideSelection,
+                filtersLayerMasks, worksWithBlankData,
+                copySourceToDestination,
+
+                inWhiteMat, outWhiteMat,
+                writeOutsideSelection,
+                filtersLayerMasks, worksWithBlankData,
+                copySourceToDestination,
+
+                inWhiteMat, outWhiteMat,
+                writeOutsideSelection,
+                filtersLayerMasks, worksWithBlankData,
+                copySourceToDestination,
+
+                inWhiteMat, outWhiteMat,
+                doNotWriteOutsideSelection,
+                filtersLayerMasks, worksWithBlankData,
+                copySourceToDestination,
+
+                inWhiteMat, outWhiteMat,
+                writeOutsideSelection,
+                filtersLayerMasks, worksWithBlankData,
+                copySourceToDestination,
+
+                inWhiteMat, outWhiteMat,
+                doNotWriteOutsideSelection,
+                filtersLayerMasks, worksWithBlankData,
+                copySourceToDestination,
+
+                inWhiteMat, outWhiteMat,
+                writeOutsideSelection,
+                filtersLayerMasks, worksWithBlankData,
+                copySourceToDestination
+            }
+        },
+    }
+};
+
+
+resource 'aete' ( TUTORIAL_FILTER_RESOURCE_ID, " dictionary", purgeable)
+{
+    1, 0, english, roman,                                   /* aete version and language specifiers */
+    {
+        TUTORIAL_FILTER_VENDORNAME,     /* vendor suite name */
+        TUTORIAL_FILTER_PLUGINDESC,     /* optional description */
+        TUTORIAL_FILTER_SUITE_ID,       /* suite ID */
+        1,                                                  /* suite code, must be 1 */
+        1,                                                  /* suite level, must be 1 */
+        {                                                   /* structure for filters */
+            TUTORIAL_FILTER_PLUGINNAME,     /* unique filter name */
+            TUTORIAL_FILTER_PLUGINDESC,     /* optional description */
+            TUTORIAL_FILTER_CLASS_ID,       /* class ID, must be unique or Suite ID */
+            TUTORIAL_FILTER_EVENT_ID,       /* event ID, must be unique to class ID */
+
+            NO_REPLY,                                       /* never a reply */
+            IMAGE_DIRECT_PARAMETER,                         /* direct parameter, used by Photoshop */
+            {                                               /* parameters here, if any */
+                TUTORIAL_FILTER_TRIGGERNAME,
+                TUTORIAL_FILTER_KEYTRIGGER,
+                TUTORIAL_FILTER_TYPETRIGGER,
+                TUTORIAL_FILTER_TRIGGERDESC,
+                flagsSingleParameter
+            }
+        },
+        {                                                   /* non-filter plug-in class here */
+        },
+        {                                                   /* comparison ops (not supported) */
+        },
+        {                                                   /* any enumerations */
+        }
+    }
+};
+~~~~~~
+
+And create the `build.bat` required for building this new plugin:
+
+~~~~~~batch
+@echo off
+setlocal
+
+echo Build script started executing at %time% ...
+set BuildType=%1
+if "%BuildType%"=="" (set BuildType=release)
+
+set PhotoshopSDKRoot=C:\Users\sonictk\src\thirdparty\adobe\photoshop\cc_2019_win\pluginsdk
+set CnvtPiPLExePath="%PhotoshopSDKRoot%\samplecode\resources\Cnvtpipl.exe"
+set PhotoshopPluginsDeployPath=C:\Users\sonictk\psplugins
+
+call "%vs2017installdir%\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+set BuildDir=%~dp0msbuild
+if not exist %BuildDir% mkdir %BuildDir%
+pushd %BuildDir%
+
+set ProjectName=tutorial_filter
+
+set EntryPoint=%~dp0src\%ProjectName%_main.cpp
+set ResourcePiPL=%~dp0src\%ProjectName%_pipl.r
+set ResourceRC=%BuildDir%\%ProjectName%_pipl.rc
+set ResourceRES=%BuildDir%\%ProjectName%_pipl.res
+
+set ThirdPartyDirPath=%~dp0..\thirdparty
+
+set OutBin=%BuildDir%\%ProjectName%.8bf
+
+set CommonLinkerFlags=/dll /incremental:no /machine:x64 /nologo /defaultlib:Kernel32.lib /defaultlib:User32.lib /defaultlib:Shell32.lib /nodefaultlib:LIBCMTD.lib /nodefaultlib:LIBCMT.lib "%ResourceRES%"
+set DebugLinkerFlags=%CommonLinkerFlags% /opt:noref /debug /pdb:"%BuildDir%\%ProjectName%.pdb"
+set ReleaseLinkerFlags=%CommonLinkerFlags% /opt:ref
+set RelWithDebInfoLinkerFlags=%CommonLinkerFlags% /opt:ref /debug /pdb:"%BuildDir%\%ProjectName%.pdb"
+
+set PSPreprocessorDefines=/DISOLATION_AWARE_ENABLED=1 /DWIN32=1 /D_CRT_SECURE_NO_DEPRECATE /D_SCL_SECURE_NO_DEPRECATE /D_WINDOWS /D_USRDLL /D_WINDLL /D_MBCS
+set PSCompilerFlags=/EHsc
+set CommonIncludePaths=/I "%ThirdPartyDirPath%" /I "%ThirdPartyDirPath%\psapi\common\includes" /I "%ThirdPartyDirPath%\psapi\common\resources" /I "%ThirdPartyDirPath%\psapi\common\sources" /I "%ThirdPartyDirPath%\psapi\photoshop" /I "%ThirdPartyDirPath%\psapi\pica_sp" /I "%ThirdPartyDirPath%\psapi\resources" /I "%ThirdPartyDirPath%\psapi\ai" /I "%BuildDir%"
+set CommonCompilerFlags=/nologo /W3 /WX %CommonIncludePaths% /Zc:__cplusplus /arch:AVX2 %PSCompilerFlags% %PSPreprocessorDefines%
+set CompilerFlagsDebug=%CommonCompilerFlags% /Od /Zi /D_DEBUG /MDd
+set CompilerFlagsRelease=%CommonCompilerFlags% /Ox /DNDEBUG /MD
+set CompilerFlagsRelWithDebInfo=%CommonCompilerFlags% /Ox /Zi /DNDEBUG /MD
+
+
+if "%BuildType%"=="debug" (
+    set BuildCommand=cl %CompilerFlagsDebug% "%EntryPoint%" /Fe:"%OutBin%" /link %DebugLinkerFlags%
+    set BuildRRCommand=cl %CompilerFlagsDebug% /EP /DMSWindows=1 /Tc "%ResourcePiPL%"
+) else if "%BuildType%"=="relwithdebinfo" (
+    set BuildCommand=cl %CompilerFlagsRelWithDebInfo% "%EntryPoint%" /Fe:"%OutBin%" /link %RelWithDebInfoLinkerFlags%
+    set BuildRRCommand=cl %CompilerFlagsRelWithDebInfo% /EP /DMSWindows=1 /Tc "%ResourcePiPL%"
+) else (
+    set BuildCommand=cl %CompilerFlagsRelease% "%EntryPoint%" /Fe:"%OutBin%" /link %ReleaseLinkerFlags%
+    set BuildRRCommand=cl %CompilerFlagsRelease% /EP /DMSWindows=1 /Tc "%ResourcePiPL%"
+)
+
+
+echo.
+echo Compiling resources (command follows below)...
+set ResourceRR=%BuildDir%\%ProjectName%_pipl.rr
+
+echo %BuildRRCommand%
+%BuildRRCommand% > "%ResourceRR%"
+if %errorlevel% neq 0 goto error
+
+echo.
+echo Converting PiPL to  Windows resource file format...
+echo %CnvtPiPLExePath% "%ResourceRR%" "%ResourceRC%"
+%CnvtPiPLExePath% "%ResourceRR%" "%ResourceRC%"
+if %errorlevel% neq 0 goto error
+
+echo.
+echo Compiling Windows Resources...
+rc /v /fo "%ResourceRES%" "%ResourceRC%"
+if %errorlevel% neq 0 goto error
+
+echo.
+echo Compiling source files for filter (command follows below)...
+echo %BuildCommand%
+echo.
+echo Output from compilation:
+%BuildCommand%
+if %errorlevel% neq 0 goto error
+
+echo.
+echo Deploying built binaries and symbols...
+copy /Y "%OutBin%"  "%PhotoshopPluginsDeployPath%"
+if %errorlevel% neq 0 goto error
+
+if "%BuildType%"=="debug" (
+    copy /Y "%BuildDir%\%ProjectName%.pdb" "%PhotoshopPluginsDeployPath%"
+    if %errorlevel% neq 0 goto error
+)
+
+if %errorlevel% == 0 goto success
+
+
+:error
+echo.
+echo ***************************************
+echo *      !!! An error occurred!!!       *
+echo ***************************************
+goto end
+
+
+:success
+echo.
+echo ***************************************
+echo *    Build completed successfully.    *
+echo ***************************************
+goto end
+
+
+:end
+echo.
+echo Build script finished execution at %time%.
+popd
+
+endlocal
+
+exit /b %errorlevel%
+~~~~~~
+
+You'll notice that we're skipping creating a `.zxp` package and signing it in
+this one; you can figure that out if you need to actually end up deploying by
+referring to the earlier Section [Package signing]. For now, let's just focus on
+development and faster builds.
+
+You should be able to now build this and get a `.8bf` file (which is the
+extension for Photoshop filter plug-ins).
+
+## Accessing layer data  ##
+
+Let's actually start doing something with that `FilterRecordPtr` we have and
+start filling up our `executeFilter` function with some meat.
+
+First, we'll get a pointer to the `ReadImageDocumentDesc` struct that is passed
+in from our `FilterRecordPtr`, which essentially gives me access to the entire
+Photoshop document's data (at least, the data that is publicly exposed to us
+through the API), and then we get access to the layers in the document through
+the `ReadLayerDesc` pointer, which, as we can see, is a linked list of
+`ReadLayerDesc` structs containing information about each layer.
+
+~~~~~~cpp
+    ReadImageDocumentDesc *docInfo = filterRecord->documentInfo;
+    assert(docInfo != NULL);
+    if (docInfo->layerCount == 0) {
+        return;
+    }
+
+    ReadLayerDesc *layerDesc = docInfo->layersDescriptor;
+    if (layerDesc == NULL) {
+        return;
+    }
+~~~~~~
+
+We then create a temporary directory to prepare for storing our exported images,
+and walk the linked list of layers to start extracting out data from them.
+
+~~~~~~cpp
+    // NOTE: (sonictk) Create a temporary directory to store the output images.
+    char *tempDirPath = (char *)malloc(MAX_PATH * sizeof(char));
+    DWORD lenTempDirPath = GetTempPathA((DWORD)MAX_PATH, (LPSTR)tempDirPath);
+    DWORD fileAttrs = GetFileAttributes((LPCTSTR)tempDirPath);
+    if (!(fileAttrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        CreateDirectory((LPCSTR)tempDirPath, NULL);
+    }
+~~~~~~
+
+With the temporary directory in hand and our access point to the layer data, we
+can now walk the linked list:
+
+~~~~~~cpp
+    int layersLeftToProcess = docInfo->layerCount;
+    int validLayers = 0;
+    int progressTotal = layersLeftToProcess;
+    int progressCounter = 0;
+    do {
+        ++progressCounter;
+        --layersLeftToProcess;
+
+        const char *layerName = layerDesc->name;
+        if (layerName == NULL || layerName[0] == '\0') {
+            layerDesc = layerDesc->next;
+            continue;
+        }
+
+        char outPath[MAX_PATH];
+        int lenPath = snprintf(outPath, 0, "%s%c%s.jpg", tempDirPath, OS_PATH_SEP, layerName);
+        snprintf(outPath, lenPath + 1, "%s%c%s.jpg", tempDirPath, OS_PATH_SEP, layerName);
+
+        // TODO: (sonictk) Read the image pixels and write the output jpg.
+
+        ++validLayers;
+
+        if (layerDesc->next != NULL) {
+            layerDesc = layerDesc->next;
+        }
+    } while (layersLeftToProcess > 0 && layerDesc != NULL);
+
+    free(tempDirPath);
+
+    return;
+~~~~~~
+
+As you can see, we skip layers with empty names, (since that's not possible
+through the Photoshop GUI under normal circumstances anyway), format an output
+filename for each layer, and then we (presumably for now) read the image pixels,
+write them out to disk, and go to the next layer.
+
+Before we continue with reading the image pixels, let's do something quick and
+hook up the built-in Photoshop progress indicator:
+
+~~~~~~cpp
+        // More code here
+        // TODO: (sonictk) Read the image pixels and write the output jpg.
+
+        gFilterRecord->progressProc(progressCounter, progressTotal);
+        if (gFilterRecord->abortProc()) {
+            break;
+        }
+
+        ++validLayers;
+
+        // More code here
+~~~~~~
+
+This will cause Photoshop to display a progress bar automatically should the
+export process take a "long time" (which Photoshop gets to determine,
+unfortunately), but more importantly, allows the end-user to cancel the
+operation by virtue of us checking the `abortProc** calback function.
+
+So now that we've got that squared away, let's continue with the process of
+reading the layer data. But first, a little primer on how Photoshop stores layer
+data.
+
+### Planar-order and pixel-order ###
+
+For reasons (not unreasonable ones), Photoshop stores its pixel data differently
+from what you might expect. We're very used to image APIs that read and write
+data in **pixel-order format**, where we generally read the red pixel's value,
+then followed by the green one, and finally the blue one (and alpha as well if
+present). However, because Photoshop's design allows for any arbitrary number of
+channels to be present in a document, this access pattern quickly falls apart
+for certain use cases. Thus, the data for each layer is stored in a linked list
+of **channels**, which are basically `ReadChannelDesc` structs (found in `PIGeneral.h`):
+
+~~~~~~cpp
+typedef struct ReadChannelDesc
+{
+
+    int32 minVersion;     /**< The minimum version needed to interpret this record. */
+    int32 maxVersion;     /**< The maximum version allowable to interpret this record. */
+
+    //---------------------------------------------------------------------------
+    //  Version 0 fields:
+    //---------------------------------------------------------------------------
+
+    struct ReadChannelDesc *next;   /**< Next descriptor in the list. */
+
+    PIChannelPort port;         /**< Port to use for reading. Provided by host. */
+
+    VRect bounds;           /**< Bounds of the channel data. */
+    int32 depth;            /**< Depth of the data; horizontal and vertical resolution. */
+
+    VPoint tileSize;        /**< Size of the tiles, set by the host. The plug-in should use
+                                 this size if possible to optimize and match the host memory
+                                 scheme. */
+    VPoint tileOrigin;      /**< Origin for the tiles, set by host. */
+
+    Boolean target;             /**< Indicates if this a target channel. TRUE if so. */
+    Boolean shown;          /**< Indicates if this channel is visible.  TRUE if so. */
+
+    int16 channelType;      /**< Channel type. See @ref ChannelTypes. */
+
+    void *contextInfo;      /**< Pointer to additional information dependent on context. */
+
+    const char *name;       /**< Name of the channel as a C string. */
+
+    //---------------------------------------------------------------------------
+    //  Version 1 fields:
+    //---------------------------------------------------------------------------
+    // New in version 1
+
+    PIChannelPort writePort; /**< Port to use for writing if writing is allowed.
+                                  This generally does not point back to the same collection
+                                  of pixels. */
+    //---------------------------------------------------------------------------
+    //  Version 2 fields:
+    //---------------------------------------------------------------------------
+    // New in version 2
+
+    unsigned32 alphaID;         /**< Persistent ID for the channel. Only set for alpha
+                                 channels. */
+
+    // New in version 3
+
+    const uint16 *unicodeName;      /**< Name of the channel as a Unicode string. (platform endianess) */
+
+    //---------------------------------------------------------------------------
+    //  Version 4 fields: (added in Photoshop CS3/10)
+    //---------------------------------------------------------------------------
+
+    // New in version 4
+
+    Boolean isEnabled;          /**< Indicates if the read channel is enabled.  Used for layer
+                                     masks and vector masks that can be disabled. */
+
+    //---------------------------------------------------------------------------
+    //  Version 5 fields:
+    //---------------------------------------------------------------------------
+    // New in version 5
+
+    VRect limitBounds;          /**< Bounds trimmed to transparency. */
+
+
+  #ifdef __cplusplus
+    ReadChannelDesc()
+        : minVersion(0), maxVersion(0), next(NULL), port(NULL), depth(0),
+        target(false), shown(false), channelType(0), contextInfo(NULL),
+        name(NULL), writePort(NULL), alphaID(0), unicodeName(NULL), isEnabled(true) {}
+  #endif // __cplusplus                 /**< ReadChannelDesc constructor. */
+
+} ReadChannelDesc;
+~~~~~~
+
+We see that there is a `port` member here that implies we should be using this
+to read the data from the channel. We'll deal with this later. But more
+importantly, this also implies that Photoshop stores layer data in a more
+channel, or *plane-oriented* manner, also known as in **planar-order format**,
+where each separate plane of pixels is stored continguously. To illustrate this
+better, I've provided a diagram below:
+
+***********************************************************
+*                                                         *
+*   Pixel-order format (RGB, RGB, RGB, ...)               *
+*                                                         *
+*   +-------------------------+                           *
+*   | RGB RGB RGB RGB RGB RGB |                           *
+*   | RGB RGB RGB RGB RGB RGB |                           *
+*   | RGB RGB RGB RGB RGB RGB |  6 x 6 x 3 bytes          *
+*   | RGB RGB RGB RGB RGB RGB |  (1 byte-per-channel)     *
+*   | RGB RGB RGB RGB RGB RGB |                           *
+*   | RGB RGB RGB RGB RGB RGB |                           *
+*   +-------------------------+                           *
+*                                                         *
+*                                                         *
+*    Planar-order format (R, R, ... G, G, ... B, B)       *
+*                                                         *
+*                                                         *
+*   +-------------+  Each plane is 6 x 6 bytes            *
+*   | R R R R R R |  (1 byte-per-channel)                 *
+*   | R R R R R R |                                       *
+*   | R R R R R R +------+                                *
+*   | R R R R R R |      |                                *
+*   | R R R R R R |      |                                *
+*   | R R R R R R |      |                                *
+*   +-------------+      |  Image planes representation   *
+*                        |                                *
+*   +-------------+      |              +-------------+   *
+*   | G G G G G G |      |              | B B B B B B |   *
+*   | G G G G G G |      |          +-------------+ B |   *
+*   | G G G G G G |      |          | G G G G G G | B |   *
+*   | G G G G G G +------+      +-------------+ G | B |   *
+*   | G G G G G G |      |      | R R R R R R | G | B |   *
+*   | G G G G G G |      +-->   | R R R R R R | G | B |   *
+*   +-------------+      |      | R R R R R R | G |---+   *
+*                        |      | R R R R R R | G |       *
+*   +-------------+      |      | R R R R R R |---+       *
+*   | B B B B B B |      |      | R R R R R R |           *
+*   | B B B B B B |      |      +-------------+           *
+*   | B B B B B B |      |                                *
+*   | B B B B B B +------+                 |              *
+*   | B B B B B B |                        |              *
+*   | B B B B B B |                        |              *
+*   +-------------+                        |              *
+*                                          v              *
+*                                                         *
+*                                  +-------------+        *
+*                                  | R R R R R R |        *
+*                                  | R R R R R R |        *
+*                                  | R R R R R R |        *
+*                                  | R R R R R R |        *
+*        Actual memory layout      | R R R R R R |        *
+*         we will get if we just   | R R R R R R |        *
+*        read the planes without   | G G G G G G |        *
+*        transforming into         | G G G G G G |        *
+*        pixel-order format        | G G G G G G |        *
+*                                  | G G G G G G |        *
+*                                  | G G G G G G |        *
+*                                  | G G G G G G |        *
+*                                  | B B B B B B |        *
+*                                  | B B B B B B |        *
+*                                  | B B B B B B |        *
+*                                  | B B B B B B |        *
+*                                  | B B B B B B |        *
+*                                  | B B B B B B |        *
+*                                  +-------------+        *
+*                                                         *
+***********************************************************
+[Figure [diagram]: An overview of two common types of pixel layouts used to represent an image.]
+
+Because we'll be making use of `stb_image_write` to handle writing out our data,
+this means that we'll need to transform the data from planar-order to
+pixel-order in order to do so.
+
+Let's now access the different channels/planes of our various layers. In each
+`ReadLayerDesc` structure, there is a `compositeChannelsList` pointer to a
+linked list of `ReadChannelDesc` structures, each of which contains the data for
+a single channel in the current layer. Since we're going to only be writing out
+JPGs for now, we'll focus on the red, green and blue channels.
+
+Adding some code to the function above in order to figure out which channels
+we're interested in will look like this:
+
+~~~~~~cpp
+#define PS_CHANNEL_ID_RED 1
+#define PS_CHANNEL_ID_GREEN 2
+#define PS_CHANNEL_ID_BLUE 3
+
+
+void findRGBChannelsForLayer(const ReadLayerDesc *layerDesc, ReadChannelDesc **rChn, ReadChannelDesc **gChn, ReadChannelDesc **bChn)
+{
+    ReadChannelDesc *curChn = layerDesc->compositeChannelsList;
+    while (curChn != NULL) {
+        int32_t tileHeight = curChn->tileSize.v;
+        int32_t tileWidth = curChn->tileSize.h;
+        if (tileHeight == 0 || tileWidth == 0) {
+            curChn = curChn->next;
+            continue;
+        }
+
+        switch (curChn->channelType) {
+        case PS_CHANNEL_ID_RED:
+            *rChn = curChn;
+            break;
+        case PS_CHANNEL_ID_GREEN:
+            *gChn = curChn;
+            break;
+        case PS_CHANNEL_ID_BLUE:
+            *bChn = curChn;
+            break;
+        default:
+            break;
+        }
+        curChn = curChn->next;
+    }
+
+    return;
+}
+
+// ...
+
+        snprintf(outPath, lenPath + 1, "%s%c%s.jpg", tempDirPath, OS_PATH_SEP, layerName);
+
+        ReadChannelDesc *rChn = NULL;
+        ReadChannelDesc *gChn = NULL;
+        ReadChannelDesc *bChn = NULL;
+        findRGBChannelsForLayer(layerDesc, &rChn, &gChn, &bChn);
+
+        int chnWidth = rChn->bounds.right - rChn->bounds.left;
+        int chnHeight = rChn->bounds.bottom - rChn->bounds.top;
+
+        gFilterRecord->progressProc(progressCounter, progressTotal);
+
+// ...
+~~~~~~
+
+"How do I know what the channel IDs are off the top of my head?", you might
+ask. The answer is unfortunately _just by debugging Photoshop itself
+manually_. (These channel IDs do not match that of the [Adobe Photoshop file
+format specification](https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/#50577409_75067),
+in case you were wondering.) In contrast the code itself is thankfully fairly simple;
+we keep walking the linked list of layers to find channels that match known
+channel IDs for red/green/blue channels, and update the pointers to them so that
+we can read from them next in the process.
+
+!!! warning The "non-production" code disclaimer reminder
+    Again, remember, this is _all_ code that is written purely to serve as an
+    example, so if you _were_ looking to try and make this code more robust, I'd
+    first and foremost be checking things like whether the document had all 3
+    R/G/B channels, whether those channels had non-null data pointers, etc.
+
+In order to read from the channel port, we'll be making use of some of the **PICA**
+functions that Photoshop exposes through the SDK to read from the port.
+
+### PICA and Ports ###
+
+Ports in the PICA architecture are essentially Adobe's interfaces to
+reading/writing data from channels in Photoshop. There are read/write ports that
+you utilize, which under-the-hood basically do all sorts of things to pass the
+memory back-and-forth between API boundaries (yours, and Adobe's). While
+slightly annoying, it's not that big of a deal, as we will see in the next section.
+
+!!! note What is PICA?
+    The name Adobe gives to its API for working with external plug-ins is called
+    **Plug-in Component Architecture**, or **PICA** for short. So if you see
+    headers in the SDK that begin with the `PI` prefix, you know where that
+    comes from now!
+
+    More information about PICA and the other `SP` API "suites", as Adobe calls
+    them, are also available in the SDK in the document called `PICA.pdf`.
+
+Reading data from a channel descriptor is relatively straightforward, but before
+we do that, let's go over how Photoshop exposes the data to you.
+
+### Tiled data ###
+
+Because Photoshop documents can get _really_ large in dimensions (and thus
+memory usage), Photoshop itself will perform tiling in order to only load the
+specific regions it needs into memory (you can see this yourself when you zoom
+into a large document and start panning around; tile blocks load in as
+needed. This is also controllable in your Photoshop preferences, under the
+**Performance** category.)
+
+This is also reflected when reading the data from the port; you retrieve tiles
+of data from a read-only port, transform the data, and then either write it back
+to a write-only port (or take that data elsewhere and do things with it, as we
+will be performing in our example.
+
+Therefore, reading the tiled data looks like this:
+
+*********************************************************************************************
+*                                                                                           *
+*        <------- 512px ----------->                     4 tiles total                      *
+*                                                                                           *
+*    ^   +-------------------------+             +----------+  ^     +----------+           *
+*    |   |//////////               |             |//////////|  |     | next     |           *
+*    |   |//////////               |             |//////////|  |     | tile     |----+      *
+*    |   |//////////               |             |//////////| 128px  | to be    |    |      *
+*    |   |//////////               |             |//////////|  |     | copied   |    |---+  *
+*    |   |bbbbbbbbbb  <--------------------------|bbbbbbbbbb|  |     |          |    |   |  *
+* 512px  |                         |             +----------+  v     +----------+    |   |  *
+*    |   |   copy stride-by-stride |                                      |          |   |  *
+*    |   |                         |             <--128px -->             +----------+   |  *
+*    |   |                         |                                          |          |  *
+*    |   |                         |                                          +----------+  *
+*    |   |                         |                                                        *
+*    |   |                         |                                                        *
+*    |   |                         |                                                        *
+*    v   +-------------------------+                                                        *
+*          large buffer (document size)                                                     *
+*                                                                                           *
+*                                                                                           *
+*********************************************************************************************
+[Figure [diagram]: An overview of how reading from channel port descriptors into our final image buffer works.]
+
+And in code, it looks like this:
+~~~~~~cpp
+void readPSChannelDataIntoBuffer(const ReadChannelDesc *chn, uint8_t *buf, const int bufWidth, int *bytesRead)
+{
+    int tileHeight = chn->tileSize.v;
+    int tileWidth = chn->tileSize.h;
+
+    int chnHeight = chn->bounds.bottom - chn->bounds.top;
+    int chnWidth = chn->bounds.right - chn->bounds.left;
+    int numTilesVert = (tileHeight - 1 + chnHeight) / tileHeight;
+    int numTilesHoriz = (tileWidth - 1 + chnWidth) / tileWidth;
+    int chnSize = tileWidth * tileHeight * chn->depth / 8;
+    int numTiles = numTilesVert * numTilesHoriz;
+
+    int totalBytesRead = 0;
+    VRect curRect;
+    int curX = 0;
+    int curY = 0;
+    for (int vertTile = 0; vertTile < numTilesVert; ++vertTile) {
+        for (int horizTile = 0; horizTile < numTilesHoriz; ++horizTile) {
+            curY = tileHeight * vertTile;
+
+            PixelMemoryDesc pxMemDesc;
+            pxMemDesc.data = sPSBuffer->New(NULL, chnSize);
+            pxMemDesc.colBits = chn->depth;
+            pxMemDesc.bitOffset = 0;
+            pxMemDesc.depth = chn->depth;
+
+            curRect.top = vertTile * tileHeight;
+            curRect.left = horizTile * tileWidth;
+            curRect.bottom = curRect.top + tileHeight;
+            curRect.right = curRect.left + tileWidth;
+
+            if (curRect.bottom > chnHeight) {
+                curRect.bottom = chnHeight;
+            }
+            if (curRect.right > chnWidth) {
+                curRect.right = chnWidth;
+            }
+
+            pxMemDesc.rowBits = (curRect.right - curRect.left) * chn->depth;
+            int stride = pxMemDesc.rowBits / PS_NUM_OF_BITS_IN_ONE_BYTE;
+            sPSChannelProcs->ReadPixelsFromLevel(chn->port, 0, &curRect, &pxMemDesc);
+
+            int curRectWidth = curRect.right - curRect.left;
+            int curRectHeight = curRect.bottom - curRect.top;
+
+            int numBytesRead = curRectWidth * curRectHeight * (chn->depth / PS_NUM_OF_BITS_IN_ONE_BYTE);
+
+            for (int h=0; h < curRectHeight; ++h) {
+                memcpy(&buf[(curY * bufWidth) + curX],
+                       &((uint8_t *)(pxMemDesc.data))[curRectWidth * h],
+                       curRectWidth * sizeof(uint8_t));
+                curY++;
+            }
+
+            totalBytesRead += numBytesRead;
+
+            sPSBuffer->Dispose((Ptr *)&pxMemDesc.data);
+
+            curX = (curX + curRectWidth) % bufWidth;
+        }
+    }
+
+    *bytesRead = totalBytesRead;
+
+    return;
+}
+~~~~~~
+
+First, you see that we make use of a new struct known as a `PixelMemoryDesc`
+descriptor to describe the tile that we are about to read from Photoshop. You
+can then see that we make use of a new suite function, the `sPSBuffer->New` one,
+to handle allocation of the memory to read the pixel data for each tile into. We
+then use the `sPSChannelProcs->ReadPixelsFromLevel` function to acutally do the
+read, tile by tile. The rest of it is just basic math to copy, stride-by-stride,
+each row of pixels to its correct position in a combined buffer large enough to
+store all the tiles together.
+
+We'll do this for each of the red, green and blue channels:
+
+~~~~~~cpp
+    int bytesRead = 0;
+    readPSChannelDataIntoBuffer(rChn, rgbPxDataPlanar, chnWidth, &bytesRead);
+
+    int totalBytesRead = bytesRead;
+    readPSChannelDataIntoBuffer(gChn, rgbPxDataPlanar + totalBytesRead, chnWidth, &bytesRead);
+
+    totalBytesRead += bytesRead;
+    readPSChannelDataIntoBuffer(bChn, rgbPxDataPlanar + totalBytesRead, chnWidth, &bytesRead);
+~~~~~~
+
+### Writing out the JPGs ###
+
+And now comes the annoying part: converting the planar-order data to pixel-order
+format:
+
+~~~~~~cpp
+// remapValue()  is baiscally just converting a 8 bit integer to its 16/32 bit equivalent.
+uint8_t remapValue(const uint16_t &val)
+{
+    uint32_t valTypeRange = (uint32_t)(powf(2.0f, (float)(sizeof(uint16_t) * PS_NUM_OF_BITS_IN_ONE_BYTE) - 1));
+    uint32_t destTypeRange = (uint32_t)(powf(2.0f, (float)(sizeof(uint8_t) * PS_NUM_OF_BITS_IN_ONE_BYTE) - 1));
+    float factor = (float)destTypeRange / (float)valTypeRange;
+    uint8_t result = (uint8_t)(factor * (float)val);
+
+    return result;
+}
+
+
+uint8_t remapValue(const uint32_t &val)
+{
+    uint64_t valTypeRange = (uint64_t)(pow(2.0f, (float)(sizeof(uint32_t) * PS_NUM_OF_BITS_IN_ONE_BYTE) - 1));
+    uint64_t destTypeRange = (uint64_t)(pow(2.0f, (float)(sizeof(uint8_t) * PS_NUM_OF_BITS_IN_ONE_BYTE) - 1));
+    double factor = (double)destTypeRange / (double)valTypeRange;
+    uint8_t result = (uint8_t)(factor * (double)val);
+
+    return result;
+}
+
+
+void convertPlanarToPixelRGB(uint8_t *dest, const uint8_t *const src, const int width, const int height, const int bytesPerChannel)
+{
+    int numPixels = width * height;
+    int curPixelIdx = 0;
+    int i = 0;
+    for (; i < (numPixels * 3); i+=3) {
+        for (int chn=0; chn < 3; ++chn) {
+            switch (bytesPerChannel) {
+            case 1:
+                dest[i + chn] = src[(curPixelIdx * bytesPerChannel) + (numPixels * chn * bytesPerChannel)];
+                break;
+            case 2:
+            {
+                uint16_t *buffer16 = (uint16_t *)src;
+                uint16_t curVal = buffer16[curPixelIdx + (numPixels * chn)];
+                uint8_t remappedVal = remapValue(curVal);
+                dest[i + chn] = remappedVal;
+                break;
+            }
+            case 4:
+            {
+                uint32_t *buffer32 = (uint32_t *)src;
+                uint32_t curVal = buffer32[curPixelIdx + (numPixels * chn)];
+                uint8_t remappedVal = remapValue(curVal);
+                dest[i + chn] = remappedVal;
+                break;
+            }
+            default:
+                return;
+            }
+        }
+        ++curPixelIdx;
+    }
+
+    return;
+}
+~~~~~~
+
+Now that we have the data in pixel-order format, we can write out the JPG
+images. We're making use of [`stb_image_write`](https://github.com/nothings/stb/blob/master/stb_image_write.h)
+for this, thanks to Sean Barrett (you can, of course, use whatever method you
+want to write out the data, and in whatever format you'd like as well):
+
+~~~~~~cpp
+    stbi_write_jpg(jpgPath,
+                   chnWidth,
+                   chnHeight,
+                   3,
+                   rgbPxDataPixel,
+                   100);
+~~~~~~
+
+(If you're stuck, feel free to refer to the final code example in the repository.)
+
+Once you build and deploy the plugin, you should now see it available for use
+under the **Filter > Other** menu in Photoshop. Running it on a document with
+layers should result in them being exported to your `%TMP%` directory as JPGs,
+and (most likely) at a fraction of the time taken than it would have taken had
+you written this as a CEP panel calling into JSX to perform the export. Cool, huh?
+
+
+# Recipe: Using Automation plug-ins to call filters #
+
+So now that we've got our filter plug-in, let's combine our Automation plug-in
+from the first recipe with it so that artists can call this code to export their
+layers from the Automation menu, where they might be more accustomed to seeing
+their plug-in.
+
+!!! note Deja vu?
+    This is also illustrated in the SDK with the Automation/Hidden filter
+    plug-in example, but I'll be going over the minimalist version here, minus
+    all the extra stuff it does within the plug-in (UI, randomizing image
+    pixels, etc.) and focusing only on the core problem of calling the filter
+    from the automation plug-in itself.
+
+For now, go ahead and copy-paste the source code from the first recipe to act as
+our automation plug-in for this purpose. Let's modify the build script a little
+bit to build both plug-ins now:
+
+## The build script ##
+
+~~~~~~batch
+@echo off
+setlocal
+
+echo Build script started executing at %time% ...
+set BuildType=%1
+if "%BuildType%"=="" (set BuildType=release)
+
+set PhotoshopSDKRoot=C:\Users\sonictk\src\thirdparty\adobe\photoshop\cc_2019_win\pluginsdk
+set CnvtPiPLExePath="%PhotoshopSDKRoot%\samplecode\resources\Cnvtpipl.exe"
+set PhotoshopPluginsDeployPath=C:\Users\sonictk\psplugins
+
+call "%vs2017installdir%\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+set BuildDir=%~dp0msbuild
+if not exist %BuildDir% mkdir %BuildDir%
+pushd %BuildDir%
+
+set ProjectName=tutorial
+
+set AutoEntryPoint=%~dp0src\%ProjectName%_auto_main.cpp
+set AutoResourcePiPL=%~dp0src\%ProjectName%_auto_pipl.r
+set AutoResourceRC=%BuildDir%\%ProjectName%_auto_pipl.rc
+set AutoResourceRES=%BuildDir%\%ProjectName%_auto_pipl.res
+
+set FilterEntryPoint=%~dp0src\%ProjectName%_filter_main.cpp
+set FilterResourcePiPL=%~dp0src\%ProjectName%_filter_pipl.r
+set FilterResourceRC=%BuildDir%\%ProjectName%_filter_pipl.rc
+set FilterResourceRES=%BuildDir%\%ProjectName%filter__pipl.res
+
+set ThirdPartyDirPath=%~dp0..\thirdparty
+
+set AutoOutBin=%BuildDir%\%ProjectName%_auto.8li
+set FilterOutBin=%BuildDir%\%ProjectName%_filter.8bf
+
+set CommonLinkerFlags=/dll /incremental:no /machine:x64 /nologo /defaultlib:Kernel32.lib /defaultlib:User32.lib /defaultlib:Shell32.lib /nodefaultlib:LIBCMTD.lib /nodefaultlib:LIBCMT.lib
+set DebugLinkerFlags=%CommonLinkerFlags% /opt:noref /debug
+set ReleaseLinkerFlags=%CommonLinkerFlags% /opt:ref
+set RelWithDebInfoLinkerFlags=%CommonLinkerFlags% /opt:ref /debug
+
+set FilterCommonLinkerFlags=/dll /incremental:no /machine:x64 /nologo /defaultlib:Kernel32.lib /defaultlib:Shlwapi.lib /defaultlib:User32.lib /defaultlib:Shell32.lib /defaultlib:Ole32.lib /defaultlib:Comctl32.lib /nodefaultlib:LIBCMTD.lib /nodefaultlib:LIBCMT.lib
+set FilterDebugLinkerFlags=%FilterCommonLinkerFlags% /opt:noref /debug /pdb:"%BuildDir%\%ProjectName%_filter.pdb" "%FilterResourceRES%"
+set FilterReleaseLinkerFlags=%FilterCommonLinkerFlags% /opt:ref "%FilterResourceRES%"
+set FilterRelWithDebInfoLinkerFlags=%FilterCommonLinkerFlags% /opt:ref /debug /pdb:"%BuildDir%\%FilterProjectName%.pdb" "%FilterResourceRES%"
+
+set PSPreprocessorDefines=/DISOLATION_AWARE_ENABLED=1 /DWIN32=1 /D_CRT_SECURE_NO_DEPRECATE /D_SCL_SECURE_NO_DEPRECATE /D_WINDOWS /D_USRDLL /D_WINDLL /D_MBCS
+set PSCompilerFlags=/EHsc
+set CommonIncludePaths=/I "%ThirdPartyDirPath%" /I "%ThirdPartyDirPath%\psapi\common\includes" /I "%ThirdPartyDirPath%\psapi\common\resources" /I "%ThirdPartyDirPath%\psapi\common\sources" /I "%ThirdPartyDirPath%\psapi\photoshop" /I "%ThirdPartyDirPath%\psapi\pica_sp" /I "%ThirdPartyDirPath%\psapi\resources" /I "%ThirdPartyDirPath%\psapi\ai" /I "%BuildDir%"
+set CommonCompilerFlags=/nologo /W3 /WX %CommonIncludePaths% /Zc:__cplusplus /arch:AVX2 %PSCompilerFlags% %PSPreprocessorDefines%
+set CompilerFlagsDebug=%CommonCompilerFlags% /Od /Zi /D_DEBUG /MDd
+set CompilerFlagsRelease=%CommonCompilerFlags% /Ox /DNDEBUG /MD
+set CompilerFlagsRelWithDebInfo=%CommonCompilerFlags% /Ox /Zi /DNDEBUG /MD
+
+set AutoLinkerFlagsDebug=%DebugLinkerFlags% /pdb:"%BuildDir%\%ProjectName%_auto.pdb" "%AutoResourceRES%"
+set AutoLinkerFlagsRelease=%ReleaseLinkerFlags% "%AutoResourceRES%"
+set AutoLinkerFlagsRelWithDebinfo=%RelWithDebInfoLinkerFlags% /pdb:"%BuildDir%\%ProjectName%_auto.pdb" "%AutoResourceRES%"
+
+
+if "%BuildType%"=="debug" (
+    set AutoBuildCommand=cl %CompilerFlagsDebug% "%AutoEntryPoint%" /Fe:"%AutoOutBin%" /link %AutoLinkerFlagsDebug%
+    set AutoBuildRRCommand=cl %CompilerFlagsDebug% /EP /DMSWindows=1 /Tc "%AutoResourcePiPL%"
+
+    set FilterBuildCommand=cl %CompilerFlagsDebug% "%FilterEntryPoint%" /Fe:"%FilterOutBin%" /link %FilterDebugLinkerFlags%
+    set FilterBuildRRCommand=cl %CompilerFlagsDebug% /EP /DMSWindows=1 /Tc "%FilterResourcePiPL%"
+) else if "%BuildType%"=="relwithdebinfo" (
+    set AutoBuildCommand=cl %CompilerFlagsRelWithDebInfo% "%AutoEntryPoint%" /Fe:"%AutoOutBin%" /link %AutoLinkerFlagsRelWithDebInfo%
+    set AutoBuildRRCommand=cl %CompilerFlagsRelWithDebInfo% /EP /DMSWindows=1 /Tc "%AutoResourcePiPL%"
+
+    set FilterBuildCommand=cl %CompilerFlagsRelWithDebInfo% "%FilterEntryPoint%" /Fe:"%FilterOutBin%" /link %FilterRelWithDebInfoLinkerFlags%
+    set FilterBuildRRCommand=cl %CompilerFlagsRelWithDebInfo% /EP /DMSWindows=1 /Tc "%FilterResourcePiPL%"
+) else (
+    set AutoBuildCommand=cl %CompilerFlagsRelease% "%AutoEntryPoint%" /Fe:"%AutoOutBin%" /link %AutoLinkerFlagsRelease%
+    set AutoBuildRRCommand=cl %CompilerFlagsRelease% /EP /DMSWindows=1 /Tc "%AutoResourcePiPL%"
+
+    set FilterBuildCommand=cl %CompilerFlagsRelease% "%FilterEntryPoint%" /Fe:"%FilterOutBin%" /link %FilterReleaseLinkerFlags%
+    set FilterBuildRRCommand=cl %CompilerFlagsRelease% /EP /DMSWindows=1 /Tc "%FilterResourcePiPL%"
+)
+
+
+echo.
+echo Compiling resources (command follows below)...
+set AutoResourceRR=%BuildDir%\%ProjectName%_auto_pipl.rr
+set FilterResourceRR=%BuildDir%\%ProjectName%_filter_pipl.rr
+
+
+echo %AutoBuildRRCommand%
+%AutoBuildRRCommand% > "%AutoResourceRR%"
+if %errorlevel% neq 0 goto error
+
+echo %FilterBuildRRCommand%
+%FilterBuildRRCommand% > "%FilterResourceRR%"
+if %errorlevel% neq 0 goto error
+
+echo.
+echo Converting Automation PiPL to Windows resource file format...
+echo %CnvtPiPLExePath% "%AutoResourceRR%" "%AutoResourceRC%"
+%CnvtPiPLExePath% "%AutoResourceRR%" "%AutoResourceRC%"
+if %errorlevel% neq 0 goto error
+
+echo.
+echo Converting Filter PiPL to Windows resource file format...
+echo %CnvtPiPLExePath% "%FilterResourceRR%" "%FilterResourceRC%"
+%CnvtPiPLExePath% "%FilterResourceRR%" "%FilterResourceRC%"
+if %errorlevel% neq 0 goto error
+
+echo.
+echo Compiling Windows Resources for automation plug-in...
+rc /v /fo "%AutoResourceRES%" "%AutoResourceRC%"
+if %errorlevel% neq 0 goto error
+
+echo.
+echo Compiling Windows Resources for filter plug-in...
+rc /v /fo "%FilterResourceRES%" "%FilterResourceRC%"
+if %errorlevel% neq 0 goto error
+
+
+echo.
+echo Compiling source files for automation plug-in (command follows below)...
+echo %AutoBuildCommand%
+echo.
+echo Output from compilation:
+%AutoBuildCommand%
+if %errorlevel% neq 0 goto error
+
+echo.
+echo Compiling source files for filter plug-in (command follows below)...
+echo %FilterBuildCommand%
+echo.
+echo Output from compilation:
+%FilterBuildCommand%
+if %errorlevel% neq 0 goto error
+
+
+echo.
+echo Deploying built binaries and symbols...
+copy /Y "%AutoOutBin%"  "%PhotoshopPluginsDeployPath%"
+if %errorlevel% neq 0 goto error
+
+echo.
+echo Deploying built binaries and symbols...
+copy /Y "%FilterOutBin%"  "%PhotoshopPluginsDeployPath%"
+if %errorlevel% neq 0 goto error
+
+if "%BuildType%"=="debug" (
+    copy /Y "%BuildDir%\%ProjectName%_auto.pdb" "%PhotoshopPluginsDeployPath%"
+    if %errorlevel% neq 0 goto error
+
+    copy /Y "%BuildDir%\%ProjectName%_filter.pdb" "%PhotoshopPluginsDeployPath%"
+    if %errorlevel% neq 0 goto error
+)
+
+if %errorlevel% == 0 goto success
+
+
+:error
+echo.
+echo ***************************************
+echo *      !!! An error occurred!!!       *
+echo ***************************************
+goto end
+
+
+:success
+echo.
+echo ***************************************
+echo *    Build completed successfully.    *
+echo ***************************************
+goto end
+
+
+:end
+echo.
+echo Build script finished execution at %time%.
+popd
+
+endlocal
+
+exit /b %errorlevel%
+~~~~~~
+
+Nothing really fancy; we're just duplicating the steps twice and compiling the
+filter and automation plug-ins separately (along with a bunch of options for the
+`.pdb` files depending on what build configuration we're using.) We're also
+sharing a single header file between the two that stores the various identifiers
+that the plug-ins use when registering with Photoshop, for reasons which will
+become clear later on.
+
+!!! warning
+    We also re-generate all UUIDs for these two new plug-ins, even if they are
+    functionally equivalent to the previous ones covered in earlier recipes, If
+    you don't, Photoshop might get confused as to which plug-in to register and
+    very odd behaviour can result.
+
+## Hiding the filter plug-in from the UI ##
+
+Now that we are building both plug-ins, let's make one change to the PIPL file
+for the filter plug-in:
+
+~~~~~~cpp
+		// ...
+		Name { TUTORIAL_FILTER_PLUGINNAME },
+		Category { "**Hidden**" },
+		Version { (latestFilterVersion << 16) | latestFilterSubVersion },
+		// ...
+~~~~~~
+
+We do this so that the filter itself doesn't show up in the Photoshop UI,
+allowing us to ensure that the end-user only has a single entry point via the UI
+to access our logic. This can be helpful if you, for example, need to do some
+sort of initialization or startup before running the filter plug-in. An example
+we're going to show right now is controlling the undo stack before activating
+the filter plug-in itself.
+
+## Calling the filter from an Automation plug-in ##
+
+So now, we'll actually have our automation plug-in do something other than print
+out "hello world". How exciting! Let's create a dummy function that will be
+called from the automation plug-in's entry point first:
+
+~~~~~~cpp
+	// ...
+	if (sSPBasic->IsEqual(caller, kPSPhotoshopCaller)) {
+		if (sSPBasic->IsEqual(selector, kPSDoIt)) {
+			PSActionsPlugInMessage *tmpMsg = (PSActionsPlugInMessage *)message;
+			status = MenuExecuteCB();
+		}
+	}
+    // ...
+~~~~~~
+
+And `MenuExecuteCB` looks like this:
+
+~~~~~~cpp
+SPErr MenuExecuteCB()
+{
+	SPErr status = kSPNoError;
+
+	Auto_Ref reference;
+	ASZString nameAsZString = NULL;
+	sPSUIHooks->GetPluginName(message->d.self, &nameAsZString);
+	sPSActionReference->PutEnumerated(reference.get(),
+									  classDocument,
+									  typeOrdinal,
+									  enumTarget);
+
+	sPSActionControl->SuspendHistory(reference.get(),
+									 ::ExecuteCB,
+									 NULL,
+									 nameAsZString);
+	sASZString->Release(nameAsZString);
+
+	return gError;
+}
+~~~~~~
+
+Now this will probably be unfamilar to you. What exactly is happening here?
+
+Well, as it turns out, the Automation plug-in is really Adobe's way of exposing
+the [Photoshop Actions](https://helpx.adobe.com/photoshop/using/actions-actions-panel.html)
+suite to you. If you're unfamiliar with Photoshop Actions, the lowdown is that
+they're basically a GUI feature that allows artists to batch together actions
+quickly by recording the steps that they've taken in a document (changing layer
+opacity, deleting a layer, making a selection, filling said selection etc.) and
+then playing them back again.
+
+Each Action has a **descriptor** that basically is metadata stored about the
+Action so that Photoshop knows what to actually _do_. This metadata varies
+between different types of actions, and can be anything from string parameters,
+floats, lists, etc.
+
+!!! tip More about Photoshop Actions
+    Because there is so little documentation on Photoshop Actions within the
+    SDK, my advice is to build the Listener plug-in within the SDK and use it to
+    record various types of Actions that you're interested in performing within
+    the scope of your plug-in. (It's also worth noting that actions can _only_
+    be performed from within Automation plug-ins)
+
+For now, the actions we're performing above basically "freeze" the history stack
+that Photoshop maintains while the ``ExecuteCB`` call is executing, and once
+it's done,  a single history item is stored with the exact name we specify. This
+improves the performance of your filter, and also reduces confusion for the
+end-user. You'll also note that we make use of various suites to perform these
+actions, which unfortunately isn't really well-documented either; you'll just
+have to get used to using the Listener plug-in and reading the various header
+files to get a sense of which functions are available under the various suites
+and which ones are appropriate for the Photoshop functionality that you're
+attempting to make use of.
+
+Let's implemente `ExecuteCB` now:
+
+~~~~~~cpp
+SPErr ExecuteCB(void *params)
+{
+	SPErr stat = kSPNoError;
+	Auto_Desc descriptor;
+	Auto_Desc result(false);
+
+	DescriptorTypeID workFilterEventID;
+	DescriptorEnumID workFilterEnumID = TUTORIAL_FILTER_ENUMINFO;
+	DescriptorEnumTypeID workFilterTypeID;
+
+	sPSActionDescriptor->PutEnumerated(descriptor.get(),
+									   TUTORIAL_FILTER_KEYTRIGGER,
+									   TUTORIAL_FILTER_TYPETRIGGER,
+									   0);
+
+	sPSActionControl->StringIDToTypeID(TUTORIAL_FILTER_UUID,
+									   &workFilterEventID);
+
+	sPSActionControl->Play(&result,
+						   workFilterEventID,
+						   descriptor.get(),
+						   plugInDialogSilent);
+
+	if (result.get() != NULL) {
+		sPSActionDescriptor->GetEnumerated(result.get(),
+										   TUTORIAL_FILTER_KEYRESULT,
+										   &workFilterTypeID,
+										   &workFilterEnumID);
+	} else {
+		BOOL status = EnumWindows(getPSMainWindowCB, (LPARAM)NULL);
+		assert(status != 0);
+		MessageBoxA(globalPSMainWindowHwnd, "Error occurred!", "Error", MB_OK|MB_ICONERROR);
+
+		return stat;
+	}
+
+	return stat;
+}
+~~~~~~
+
+This is the actual meat right here; you can see why now we share the header
+files between the two plug-ins: we need to give access to the Automation plug-in
+to call the UUID of the filter plug-in through the actions suite. Additional IDs
+can be passed into the filter plug-in as well, in order to read/write data and
+communicate between the two plug-ins (for example, if you wanted a
+Plain-Old-Data (POD) result from the filter once it had finished
+executing). We'll not be making use of that here in this example.
+
+Compile, deploy, run Photoshop, and you should be able to see the Automation plug-in show
+up in your Automation menu in the main menu, while the Filter plug-in should
+have disappeared from the Filter menu. You should then be able to run the
+Automation plug-in and have it generate the JPGs like before instead!
+
+
+# Recipe: Communicating between CEP panels and C++ plug-ins #
+
+The last recipe I'll be focusing on today involves a tiny bit of JavaScript/JSX
+(which is necessary when creating CEP panels). I will _not_ be going over how to
+create CEP panels, so please refer to the source code example in the repository
+if you need guidance. You can also refer to the
+[CEP documentation](https://github.com/Adobe-CEP/Getting-Started-guides),
+which is _much_ better documented than the C++ SDK.
+
+This recipe will show you how to trigger an Automation plug-in (which you can
+extend to anything, as we've seen from our previous example) from a CEP
+panel. You might find this useful, for example, if you needed functionality from
+the CEP suite (or vice versa), or if you needed your UI to have native "look and
+feel" of the Photoshop interface (or dockable**.
+
+How this is going to work, in a diagram:
+
+*************************************************************************************
+*                                                     +----------------------+      *
+*                                                     |                      |      *
+*                                                     |    CEP Panel (HTML)  |      *
+*                                                     |                      |      *
+*                                                     +-------------+--------+      *
+*                                                                   |               *
+*                                                                   |               *
+*                                                                   |               *
+*                                                          +--------v---------+     *
+*                                                          |   JavaScript     |     *
+*                                                          |      (.js)       |     *
+* +---------------------+                                  |                  |     *
+* |                     |                                  +---------+--------+     *
+* |  AutomationPlugin   |                                            |              *
+* |     (.8li dll)      |                                            |              *
+* +-------^-------------+                                            |              *
+*         |                                                          |              *
+*         |                +--------------------+             +------v-----------+  *
+*         | subscribes     |                    |  dispatches |  Adobe           |  *
+*         +---------------->  PlugPlugOwl.dll   <-------------+  ExtendScript    |  *
+*           to events      |                    |   events    |      (.jsx)      |  *
+*                          +--------^-----------+             +------------------+  *
+*                                   |                                               *
+*                                   |                                               *
+*                                   |                                               *
+*                          +--------v---------------+                               *
+*                          |                        |                               *
+*                          |   CSXS event           |                               *
+*                          |   (metadata)           |                               *
+*                          +------------------------+                               *
+*************************************************************************************
+[Figure [diagram]: An overview of CSXS communication between the CEP panel and native plug-in.]
+
+It's also worth noting here that the JSX layer can _also_ subscribe to events;
+it doesn't need to be limited to just one-way traffic, as we will see later.
+
+
+## Additonal requirements ##
+
+Before we begin, you'll need to download the
+[Adobe Illustrator SDK](https://console.adobe.io/downloads)
+as well from Adobe's website. We'll be modifying copies of the `SDKPlugPlug.h` and
+`SDKPlugPlug.cpp` sources within the SDK; these are not available in the
+Photoshop SDK itself. These sources normally live at `samplecode\common\source`
+and `samplecode\common\includes` in the Illustrator SDK. Make copies of these
+two files and place them in your current project's sources.
+
+!!! note What is CSXS?
+    CSXS, or the Adobe **Creative Suites Extended Services**, is the name given
+    to the set of functionalities that Adobe exposes to allow different Creative
+    Suite products (Photoshop, Premiere Pro, Illustrator, After Effects etc.) to
+    communicate with each other. CEP is the intended successor of this moniker,
+    but for both historical and practical reasons (CEP does not encompass all
+    previous functionality), you'll find the legacy moniker scattered around the
+    codebase as you look around Photoshop's SDK.
+
+I also won't bother with signing the extension in this recipe (since we already
+covered how to do that in Section Package signing), so make sure that you [follow
+the instructions](https://github.com/Adobe-CEP/Getting-Started-guides/blob/master/Client-side%20Debugging/readme.md#set-the-debug-mode)
+for how to enable running unsigned extensions within Photoshop on your development machine.
+
+
+## A sample CEP panel ##
+
+As stated, I'm going to skip how to create a panel. If you're familiar with how
+to create UI in a declarative-style manner, you'll grok this in no time if you
+take a look at the actual CEP documentation.  Besides, as you will see, it's
+really just HTML markup:
+
+~~~~~~html
+<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" type="text/css" href="css/ui.css">
+  </head>
+
+  <body>
+    <div>
+      <h4>Export layers</h4>
+
+      <p ">Exports layers from the current document.</p>
+
+      <button id="btnAccept">Extract</button>
+      <button id="btnClose">Close</button>
+
+    </div>
+
+  </body>
+
+  <script src="js/CSInterface.js"></script>
+  <script src="js/main.js"></script>
+</html>
+~~~~~~
+
+!!! note Where can I get `CSInterface.js`?
+    Again, this is available as part of the Adobe CEP SDK.
+
+The CSS used is available in the repository, but could easily just be omitted as
+well, since it's just for styling purposes. The logic driving the UI is also
+dirt-simple as well:
+
+~~~~~~javascript
+var globalCSInterface = new CSInterface();
+var extensionRootDirPath = globalCSInterface.getSystemPath(SystemPath.EXTENSION);
+
+
+function ExportLayersCB() {
+    globalCSInterface.evalScript("ESPSExportLayers();");
+
+    return;
+}
+
+
+function ClosePanelCB() {
+    globalCSInterface.closeExtension();
+
+    return;
+}
+
+btnAccept.onclick = ExportLayersCB;
+btnClose.onclick = ClosePanelCB;
+
+globalCSInterface.evalScript("ESPSActivateAutomationPlugin();");
+~~~~~
+
+Yes, it's JavaScript, or rather, a specific dialect of JavaScript that Adobe
+calls **ExtendScript**. It's used for scripting in Adobe products (well, apart
+from Flash, but that's dead) and is generally the "supported" route when it
+comes to extending Photoshop these days.
+
+You can see that we're basically hooking up the buttons to fire off JavaScript
+functions, which make use of the `CSInterface` singleton that we acquire in the
+beginning. The **Close** button will, as the name implies, close the panel. The
+other button, however, will run something called `ESPSExportLayers()`, while
+there's something at the end of the script that calls
+`ESPSActivateAutomationPlugin()`.
+
+`ESPSExportLayers` looks like this:
+
+~~~~~~javascript
+function ESPSExportLayers() {
+    // The library might not exist in some Photoshop versions.
+    try {
+        var xLib = new ExternalObject("lib:\PlugPlugExternalObject");
+    } catch (e) {
+        alert(e);
+        return;
+    }
+
+    if (xLib) {
+        var eventObj = new CSXSEvent();
+        eventObj.type = EXPORT_LAYERS_CSXS_EVENT_ID;
+        eventObj.data = true;
+        eventObj.dispatch();
+        return;
+    }
+    return;
+}
+~~~~~~
+
+
+## `SDKPlugPlug` to the rescue ##
+
+Now, in order to actually make use of the CSXS functionality, we're going to
+need to modify the source files from the Adobe Illustrator SDK in order for them
+to work in Photoshop.
+
+First of all, if we take a look at `SDKPlugPlug.cpp`:
+
+~~~~~~cpp
+AIErr SDKPlugPlug::Load(AIFoldersSuite* sAIFolders)
+{
+	AIErr err = kNoErr;
+
+	do {
+
+#ifdef WIN_ENV
+		AIFolderType folderType = kAIApplicationFolderType;
+		ai::UnicodeString libName("PlugPlugOwl.dll");
+#else
+		AIFolderType folderType = kAIContentsFolderType;
+		ai::UnicodeString libName("/Frameworks/PlugPlugOwl.framework");
+#endif
+
+		ai::FilePath path;
+		err = sAIFolders->FindFolder(folderType, false, path);
+		if(err) { break; }
+
+
+		path.AddComponent(libName);
+		if(!path.Exists(false)) { err = kCantHappenErr; break; }
+
+#ifdef WIN_ENV
+		fhModule =  LoadLibraryW(path.GetFullPath().as_WCHARStr().as_LPCWSTR());
+		if(!fhModule) { err = kCantHappenErr; break; }
+
+		pFnLoadExtension = (PlugPlugLoadExtensionFn) GetProcAddress(fhModule, "PlugPlugLoadExtension");
+		if(!pFnLoadExtension) { err = kCantHappenErr; break; }
+
+		pFnUnloadExtension = (PlugPlugUnloadExtensionFn) GetProcAddress(fhModule, "PlugPlugUnloadExtension");
+		if(!pFnUnloadExtension) { err = kCantHappenErr; break; }
+
+		pFnAddEventListener = (PlugPlugAddEventListenerFn) GetProcAddress(fhModule, "PlugPlugAddEventListener");
+		if(!pFnAddEventListener) { err = kCantHappenErr; break; }
+
+		pFnRemoveEventListener = (PlugPlugRemoveEventListenerFn) GetProcAddress(fhModule, "PlugPlugRemoveEventListener");
+		if(!pFnRemoveEventListener) { err = kCantHappenErr; break; }
+
+		pFnDispatchEvent = (PlugPlugDispatchEventFn) GetProcAddress(fhModule, "PlugPlugDispatchEvent");
+		if(!pFnDispatchEvent) { err = kCantHappenErr; break; }
+
+// ... More code below
+~~~~~~
+
+This is pretty much what we're looking for. You can see that on Windows, the
+code looks for the presence of a DLL called `PlugPlugOwl.dll` (and the
+corresponding framework on OSX) and then attempts to find a couple of functions
+within it, functions that we will be making use of in our native C++ plugin to
+subscribe to events that we emit from our CEP panel. This DLL ships with
+Photoshop as well with all the same functionality of the Illustrator one, so we
+don't need to worry about that part, at least.
+
+However, in order to actually be able to use the functionality with Photoshop,
+we're going to have to modify this file and the header as well. Let's add these
+lines:
+
+~~~~~~cpp
+#ifdef WIN_ENV
+#include <windows.h>
+
+#define SDKPLUGPLUG_MAX_PATH MAX_PATH
+#define SDKPLUGPLUG_OWL_DLL_FILENAME "PlugPlugOwl.dll"
+
+#endif
+
+// ...
+
+
+#include <Windows.h>
+#include <string>
+#include <cassert>
+
+
+int getCurrentProcessFileName(char *filename, int size)
+{
+	DWORD resultDW = GetModuleFileNameA(NULL, (LPTSTR)filename, (DWORD)size);
+
+	int result = (int)resultDW;
+
+	return result;
+}
+
+
+std::string PSFindPlugPlugDLLFileName()
+{
+	char plugPlugOwlDLLFileName[SDKPLUGPLUG_MAX_PATH];
+	int processFilePathLength = getCurrentProcessFileName(plugPlugOwlDLLFileName, SDKPLUGPLUG_MAX_PATH);
+
+	assert(processFilePathLength > 0);
+
+	std::string result = std::string(plugPlugOwlDLLFileName);
+
+	size_t lastPathSepIdx = result.rfind("\\");
+	result.erase(lastPathSepIdx + 1);
+
+	result += SDKPLUGPLUG_OWL_DLL_FILENAME;
+
+	return result;
+}
+~~~~~~
+
+Nothing particularly fancy; we're basically just looking for a `PlugPlugOwl.dll`
+file based off the current Photoshop executable's directory, and then continue
+to load it into Photoshop. After that, we continue the same way by looking for
+the addresses of the symbols that we're interested in within the DLL.
+
+While we're at it, because we're actually making Photoshop plug-ins and not
+Illustrator ones, we also probably should change those `AIErr` return status
+codes to `SPErr` ones that we actually have available:
+
+~~~~~~cpp
+SPErr SDKPlugPlug::Load()
+{
+	SPErr err = kNoErr;
+
+	do {
+		// NOTE: (sonictk) Find the DLL location dynamically instead of having it hard-coded
+		// to a specific file path, since this can change depending on the Photoshop install location
+		// in various deployment systems.
+		std::string libName = PSFindPlugPlugDLLFileName();
+
+#ifdef WIN_ENV
+		fhModule =  LoadLibraryA(libName.c_str());
+		if(!fhModule) { err = kCantHappenErr; break; }
+
+		pFnLoadExtension = (PlugPlugLoadExtensionFn) GetProcAddress(fhModule, "PlugPlugLoadExtension");
+		if(!pFnLoadExtension) { err = kCantHappenErr; break; }
+
+		pFnUnloadExtension = (PlugPlugUnloadExtensionFn) GetProcAddress(fhModule, "PlugPlugUnloadExtension");
+		if(!pFnUnloadExtension) { err = kCantHappenErr; break; }
+
+		pFnAddEventListener = (PlugPlugAddEventListenerFn) GetProcAddress(fhModule, "PlugPlugAddEventListener");
+		if(!pFnAddEventListener) { err = kCantHappenErr; break; }
+
+		pFnRemoveEventListener = (PlugPlugRemoveEventListenerFn) GetProcAddress(fhModule, "PlugPlugRemoveEventListener");
+		if(!pFnRemoveEventListener) { err = kCantHappenErr; break; }
+
+		pFnDispatchEvent = (PlugPlugDispatchEventFn) GetProcAddress(fhModule, "PlugPlugDispatchEvent");
+		if(!pFnDispatchEvent) { err = kCantHappenErr; break; }
+#else
+
+// ... More code below
+~~~~~~
+
+If you need more help, or just want to use the final result, The full example is
+available in the `thirdparty/psapi/ai` folder in the accompanying
+[source repository](https://github.com/sonictk/ps_cpp_recipes).
+
+!!! note Why isn't this in the Photoshop SDK natively?
+    Your guess is as good as mine. But according to Tom Ruark of Adobe:
+
+    _"Using those files in a Photoshop plugin and Photoshop as the host is
+    perfectly fine. I never added them to the Photoshop SDK as I never had an
+    official plugin to exercise them with. The CEP SDK was a separate thing
+    and I didn't want to tie them together."_
+
+    So there you have it. The reason is...the lack of example documentation from
+    themselves? I'm honestly not sure what to make of it other than "we don't
+    have time."
+
+## CEP to C++ ##
+
+So now that our native plug-in is ready to communicate, let's test it out. We'll
+go ahead and subscribe to an event of our choosing in the native plug-in:
+
+~~~~~~cpp
+#define EXPORT_LAYERS_CSXS_EVENT_ID "com.examples.exportlayers.exportlayers"
+
+static SDKPlugPlug *globalSDKPlugPlug = NULL;
+static bool globalEventListenerRegistered = false;
+
+
+void CSXSEventExportLayersCB(const csxs::event::Event *const event, void *const context)
+{
+	if (event->data == NULL) {
+		return;
+	}
+
+	BOOL status = EnumWindows(getPSMainWindowCB, (LPARAM)NULL);
+	assert(status != 0);
+	MessageBoxA(globalPSMainWindowHwnd, "Hello World from CEP!", "Tutorial Dialog", MB_OK|MB_ICONINFORMATION);
+
+	return;
+}
+
+
+if (!globalSDKPlugPlug) {
+	globalSDKPlugPlug = new SDKPlugPlug;
+	status = globalSDKPlugPlug->Load();
+	if (status != kSPNoError) {
+		delete globalSDKPlugPlug;
+		return status;
+	}
+}
+
+if (!globalEventListenerRegistered) {
+	csxs::event::EventErrorCode csxsStat;
+	csxsStat = globalSDKPlugPlug->AddEventListener(EXPORT_LAYERS_CSXS_EVENT_ID,
+												   CSXSEventExportLayersCB,
+												   NULL);
+	if (csxsStat != csxs::event::EventErrorCode::kEventErrorCode_Success) {
+		return kSPLogicError;
+	}
+
+	globalEventListenerRegistered = true;
+~~~~~~
+
+Now, go ahead and open the panel in Photoshop, and click on the button. You
+should get your dialog pop up back. Congratulations, you've now executed C++
+code from your CEP panel?
+
+## C++ to CEP ##
+
+Of course, if you needed to trigger events in your CEP panel from C++ (such as
+updating a progress bar, logging, changing UI elements etc.), you can use the
+CSXS mechanism to do this as well. Simply dispatch the event from C++:
+
+~~~~~~cpp
+#define DONE_CSXS_EVENT_ID "com.examples.exportlayers.doneevent"
+
+
+csxs::event::Event pluginDoneEvent;
+pluginDoneEvent.type = DONE_CSXS_EVENT_ID;
+pluginDoneEvent.scope = csxs::event::kEventScope_Application;
+pluginDoneEvent.appId = CSXS_PHOTOSHOP_APPID;
+pluginDoneEvent.extensionId = TUTORIAL_CSXS_CEP_COMMUNICATION_PLUGINNAME;
+pluginDoneEvent.data = "Hello back from C++!";
+
+globalSDKPlugPlug->DispatchEvent(&pluginDoneEvent);
+~~~~~~
+
+And in your JavaScript layer, subscribe to that event:
+
+~~~~~~javascript
+var DONE_CSXS_EVENT_ID = "com.examples.exportlayers.doneevent";
+
+globalCSInterface.addEventListener(DONE_CSXS_EVENT_ID,
+                                   function(event) {
+                                       AlertDialog(event.data);
+                                       return;
+                                   });
+
+function AlertDialog(msg) {
+    globalCSInterface.evalScript("alert(\"" + msg + "\");");
+
+    return;
+}
+~~~~~~
+
+Now, once you run your native plug-in to the point where the event is
+dispatched, you should see Photoshop launch a dialog with your text back from
+the native plug-in.
+
+Again, if you need additional help or have trouble grokking this, the full
+source code for both the panel and the native plug-in are available in the [repository](https://github.com/sonictk/ps_cpp_recipes).
+
+
+# Recipe: Custom UI for plug-ins using ImGui #
+
+I decided to add one more recipe here since this is something that I've seen
+some people express interest in learning more about, and I haven't seen any
+other company attempt this yet in their Photoshop tooling (if any exists in the
+first place at all to begin with). If you're a seasoned Photoshop user, you're
+no doubt aware that certain filter plug-ins have their own UIs to allow you to
+tweak settings, sometimes even with an interactive document preview, before
+applying the filter to the image pixels themselves (the Liquify filter is an
+example of this).
+
+Here, I'm going to show you how to incorporate a UI for your own filter plugins,
+albeit a fairly simplistic one using [Dear ImGui](https://github.com/ocornut/imgui).
+
+!!! note Why Dear ImGui and not Qt, WPF, WinUI, etc.
+    I've tried all of them and trust me, apart from ImGui
+    and [Nuklear](https://github.com/Immediate-Mode-UI/Nuklear), I don't see
+    myself ever using anything else in the near future. The topic of GUI and the
+    idea of designing immediate/retained-mode GUIs should probably be reserved
+    for another time, but you can
+    watch [Casey Muratori's](https://www.youtube.com/watch?v=Z1qyvQsjK5Y) video
+    on the topic.
+
+## Additional Requirements ##
+
+Obviously, you're going to need ImGui. We'll also be basing this recipe off
+Section Recipe: Using Automation plug-ins to call filters, so make sure you've
+gone over that one first and have the code ready. Alternatively, you can use the
+code in the accompanying code repository as a starting guide.
+
+!!! note Don't forget!
+    If you're going to re-use the code from earlier, remember to re-generate the
+    UUIDs and change the identifiers for the new plug-in. Photoshop isn't going
+    to like it if you have two plug-ins that look the same to it.
+
+## The trick behind the curtain ##
+
+There is none, really. What we're going to do to mimic the look of having ImGui
+integration in Photoshop is as simple as this:
+
+1. Create a new window that is fullscreen and transparent.
+2. Create a Direct3D context for that window to be able to use the GPU to draw
+   onto it (it doesn't matter, really, you could use GDI if you really wanted
+   to. In this case we're going to use D3D11.)
+3. Draw ImGui to that window. Remember, we're still on the main Photoshop
+   thread, so we're still fulfilling the rule that our plug-in should be
+   modal. By making the window fullscreen as well, we prevent Photoshop from
+   taking any window messages from the Windows queue that could potentially be
+   processed as well.
+4. Profit.
+
+As you can see, this is absurdly simple and should be pretty obvious to anyone
+with even a modicum of Win32 programming experience. However, there is a single
+gotcha when implementing this, which I'll be getting to in a bit.
+
+!!! note I'm a little lost...
+    This isn't a Win32 programming tutorial, so I'm not posting the full window
+    creation code, along with the message loop here. If you'd like a full
+    example, look in the [repository](https://github.com/sonictk/ps_cpp_recipes)
+    for the `tutorial_imgui_gui_win32_d3d11.cpp` file that contains the
+    windowing and GUI-specific code to see how it's done.
+
+## Creating a transparent window ##
+
+We're going to take the route of least resistance here and make use of
+[Layered Windows](https://docs.microsoft.com/en-us/windows/win32/winmsg/window-features#layered-windows)
+to help create our window transparency. The key here is to make sure that when
+we create the window, that we use the extended window style `WS_EX_LAYERED` and
+make use of `SetLayeredWindowAttributes` to set the `LWA_COLORKEY` attribute,
+like so:
+
+```cpp
+	HWND guiHWnd = CreateWindowEx(WS_EX_LAYERED,
+								  GUI_WNDCLASS_NAME,
+								  GUI_WNDTTILE,
+								  WS_POPUP,
+								  monitorInfo.rcMonitor.left,
+								  monitorInfo.rcMonitor.top,
+								  clientRect.right - clientRect.left,
+								  clientRect.bottom - clientRect.top,
+								  parentPSWindow,
+								  NULL,
+								  windowClass.hInstance,
+								  NULL);
+	SetLayeredWindowAttributes(guiHWnd, RGB(0,255,0), 0, LWA_COLORKEY);
+```
+
+Yep, we're using pure green as our color key; this means that any time we draw
+the colour green, Windows will treat that as a transparent pixel and draw the
+underlying pixels of the other windows lower in the Z-order instead. Therefore,
+later when we start drawing into our window, all we have to do is make sure that
+we draw using that colour on areas of the window that are _not_ our ImGui
+widget, and we'll have window transparency!
+
+We're also going to set the Photoshop main window as our parent window here, so
+that it can take ownership of our ImGui tool window. Unfortunately, becuase the
+Photoshop UI itself is composed of a bunch of floating windows as well, finding
+the top-level parent window is a bit of a pain:
+
+```cpp
+static HWND globalPSMainWindowHwnd = NULL;
+static const char GLOBAL_PS_WIN32_WINDOW_CLASS_NAME[] = "Photoshop";
+
+BOOL CALLBACK getPSMainWindowCB(HWND hwnd, LPARAM)
+{
+	char windowClassName[WIN32_MAX_CLASS_NAME_LENGTH];
+	GetClassNameA(hwnd, (LPSTR)windowClassName, WIN32_MAX_CLASS_NAME_LENGTH);
+
+	if (strncmp(windowClassName, GLOBAL_PS_WIN32_WINDOW_CLASS_NAME, WIN32_MAX_CLASS_NAME_LENGTH) == 0) {
+		globalPSMainWindowHwnd = hwnd;
+	}
+
+	return TRUE;
+}
+
+HWND getPSMainWindow()
+{
+	BOOL status = EnumWindows(getPSMainWindowCB, (LPARAM)NULL);
+	if (status == 0) {
+		globalPSMainWindowHwnd = NULL;
+	}
+
+	return globalPSMainWindowHwnd;
+}
+```
+
+If there's a better way to do this (possibly from the PS SDK itself that I might
+have missed?), I'd love to know. But for now, this seems to work.
+
+We also want the window to cover the entire screen that Photoshop is on. Thus:
+
+```cpp
+	HMONITOR hMonitor = MonitorFromWindow(parentPSWindow, MONITOR_DEFAULTTONEAREST);
+	MONITORINFOEX monitorInfo;
+	ZeroMemory(&monitorInfo, sizeof(monitorInfo));
+	monitorInfo.cbSize = sizeof(monitorInfo);
+	GetMonitorInfo(hMonitor, &monitorInfo);
+
+	gGUIWidth = monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left;
+	gGUIHeight = monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top;
+
+	RECT clientRect = {0, 0, gGUIWidth, gGUIHeight};
+	AdjustWindowRectEx(&clientRect, WS_POPUP, FALSE, WS_EX_LAYERED);
+```
+
+## Drawing to the window ##
+
+This isn't a tutorial on the graphics pipeline, so I'm making use of Direct3D 11
+here to handle the draw; I recommend you either do the same or, if you're
+familiar with Direct3D 12, to make use of that instead. Either way, the main
+render loop looks like this:
+
+```cpp
+#define GUI_ACCEPT 1
+#define GUI_REJECT 0
+
+struct GUIResult
+{
+	char *exportPath;
+	int8_t accepted;
+	int width;
+	int height;
+	int jpgQuality;
+};
+
+static float gD3D11ClearColor[4] = {0.0f, 1.0f, 0.0f, 1.0f};
+
+// ....more code here that eventually calls our filter GUI function and passes
+// in a pointer to a GUIResult struct
+
+	static bool shouldShowWindow = true;
+
+	MSG msg;
+	ZeroMemory(&msg, sizeof(msg));
+	while (msg.message != WM_QUIT) {
+		if (PeekMessage(&msg, NULL, 0U, 0U, PM_REMOVE)) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+			continue;
+		}
+
+		if (!shouldShowWindow) {
+			PostMessage(guiHWnd, WM_CLOSE, 0, 0);
+		}
+
+		ImGui_ImplDX11_NewFrame();
+		ImGui_ImplWin32_NewFrame();
+		ImGui::NewFrame();
+		{
+			ImGui::SetNextWindowSize(gImGuiWndSize, ImGuiCond_Always);
+
+			static const ImGuiWindowFlags imGuiWndFlags = ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoCollapse;
+
+			if (shouldShowWindow) {
+				ImGui::Begin("Export Options", NULL, imGuiWndFlags);
+
+				ImGui::InputInt("Width", &(uiResult->width), 1, INT_MAX);
+				ImGui::InputInt("Height", &(uiResult->height), 1, INT_MAX);
+				ImGui::SliderInt("Quality", &(uiResult->jpgQuality), 1, 100);
+				ImGui::InputText("Export directory", uiResult->exportPath, PS_MAX_PATH);
+
+				ImGui::SetItemDefaultFocus();
+				if (ImGui::Button("Ok")) {
+					uiResult->accepted = GUI_ACCEPT;
+					shouldShowWindow = false;
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Cancel")) {
+					uiResult->accepted = GUI_REJECT;
+					shouldShowWindow = false;
+				}
+
+				ImGui::End();
+			}
+
+		}
+		ImGui::Render();
+
+		gD3D11DeviceContext->OMSetRenderTargets(1, &gD3D11MainRTV, NULL);
+		gD3D11DeviceContext->ClearRenderTargetView(gD3D11MainRTV, gD3D11ClearColor);
+		ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+		gD3D11SwapChain->Present(1, 0);
+	}
+```
+
+!!! tip I don't understand where I should be typing this code! I need help!
+    Most of this code is straight from the D3D11 implementation that ships with
+    ImGui itself, so I recommend taking a look at it or the example in the
+    repository if you're unsure of what to do or how to set up a Direct 3D
+    rendering context. Again, I am not focusing on how to work with DX11 or how
+    the graphics pipeline works. If you're more familiar with OpenGL, you are
+    welcome to use that instead for drawing as well.
+
+If you're a little eagle-eyed here, you'll notice something that might seem a
+liitle odd:
+
+```cpp
+				if (ImGui::Button("Cancel")) {
+					uiResult->accepted = GUI_REJECT;
+					shouldShowWindow = false;
+				}
+```
+
+Why am I doing something like this here instead of just `break`ing out of the
+loop?
+
+Well, for some reason, if you do that, you'll segfault Photoshop after, along
+with inducing other weird behaviours (like MessageBoxA windows no longer
+appearing and always returning an ID that indicates you accepted the dialogs). I
+haven't quite tracked down why this happens, honestly, but it looks like doing
+that causes Photoshop to eventually look up a `NULL` pointer when unwinding the
+stack after exiting and un-loading your plug-in. The only way to avoid this, as
+far as I can tell, is to let the render loop finish and swap the framebuffer,
+_then_ send the `WM_CLOSE` message to the window and let the window procedure
+handle the rest (you can still do things like prompt for close confirmation in
+your window procedure, if you so desire).
+
+The rest of this is just cleanup, which shouldn't be any big surprise.
+
+```cpp
+	ImGui_ImplDX11_Shutdown();
+	ImGui_ImplWin32_Shutdown();
+	ImGui::DestroyContext();
+
+	CleanupD3D11Device();
+	DestroyWindow(guiHWnd);
+	UnregisterClassA(windowClass.lpszClassName, windowClass.hInstance);
+```
+
+Once done, go ahead and launch your plug-in within Photoshop. You should see
+your ImGui window show up:
+
+![ImGui Window](https://raw.githubusercontent.com/sonictk/ps_cpp_recipes/master/recipes/5_imgui_tool/resources/imgs/preview.png)
+
+And that's it! I know this was a little fast for those of you who are not
+innately familiar with ImGui or Win32 programming, so again, please check the
+repository for the full source code if you're stuck or having a hard time trying
+to figure out which code goes where.
+
+
+# Closing thoughts #
+
+It's been a pretty long road to get to the end, but hopefully by now you should
+have more confidence about working with the Photoshop C++ SDK, and have a better
+appreciation for the legacy of an ageing codebase that still sees widespread use
+today, even as the SDK has been left to rot for quite a while in favour of the
+CEP layer and all sorts of newfangled web tech stacks. We have tons of artists
+using Photoshop, but the tooling available at the moment is pretty
+limited. Hopefully if you're called upon to in the future, you'll be able to
+make a difference with your newfound knowledge.
+
+If you see any errors or have any questions about this tutorial, feel free to
+[file an issue](https://github.com/sonictk/ps_cpp_recipes/issues) on the Github repo.
+
+
+# Credits #
+
+* Tom Ruark of Adobe, for helping to assist with some of my queries.
+
+* [Sean Barrett](https://github.com/nothings/stb), for the `stb` libraries which we make use of in this tutorial.
+
+* [Morgan Mcguire](https://casual-effects.com/markdeep/), for the Markdeep format.
+
+* Aras Pranckevicius, for writing the original Markdeep theme used in this tutorial.
+
+* Omar Cornut, for writing Dear ImGui.
+
+<style class="fallback">body{visibility:hidden}</style><script>markdeepOptions={tocStyle:'medium'};</script>
+<!-- Markdeep: --><script src="https://casual-effects.com/markdeep/latest/markdeep.min.js?" charset="utf-8"></script>
